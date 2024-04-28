@@ -1,0 +1,20 @@
+[package]
+name = "glia"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies.base64]
+version = "0.22"
+
+[dependencies.rand]
+version = "0.8"
+
+[dependencies.chrono]
+version = "0.4"
+
+[dependencies.mio]
+version = "0"
+
+[dependencies.tokio]
+version = "1"
+features = ["full"]
