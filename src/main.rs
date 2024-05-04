@@ -1,6 +1,8 @@
 mod netting;
 
-use std::{net::IpAddr, sync::{atomic::{AtomicBool, Ordering}, mpsc, Mutex}, thread, time::{Duration, Instant}};
+use std::{net::IpAddr, sync::{atomic::{AtomicBool, Ordering}, mpsc, Mutex}, thread};
+
+use chrono::{Duration, DateTime, Utc};
 
 #[derive(Default)]
 pub enum Terrain {
@@ -84,8 +86,8 @@ pub enum UserAction {
 }
 
 impl UserAction {
-    fn timestamp(&self) -> std::time::Instant {
-        std::time::Instant::now()
+    fn timestamp(&self) -> DateTime<Utc> {
+        Utc::now()
     }
 }
 
@@ -115,14 +117,14 @@ impl World {
 
 pub struct Connection {
     pub last_sync_generation: u64,
-    pub last_sync: Instant,
+    pub last_sync: DateTime<Utc>,
     pub socket: (),
 }
 
 impl Connection {
     pub fn link_to(target_ip: IpAddr, socket: u16, frozen_world: World) -> Self {
         let a = Self {
-            last_sync: Instant::now(),
+            last_sync: Utc::now(),
             last_sync_generation: frozen_world.generation,
             socket: (),
         };
@@ -166,7 +168,7 @@ impl<'a> Interpolation<'a> {
     pub fn deduce_transition(w0: &'a World, w1: &'a World, time_since_w0: Duration) -> Self {
         // Target is 60 fps but each world iteration is potentially long lasting. Aim half second
         // delay for now. The world diff will inform additional information here.
-        if time_since_w0 > Duration::from_millis(1000/60) {
+        if time_since_w0 > Duration::milliseconds(1000/60) {
             return Self::CheckpointReached(w1, time_since_w0);
         }
         Self::Transition(Transition {
@@ -201,12 +203,12 @@ impl<'a> Interpolation<'a> {
                 Self::Transition(t) => {
                     return Some(RenderSource::Transition(t));
                 },
-                a @ Self::CheckpointReached(world, _) => match world_iter.next() {
+                Self::CheckpointReached(new_old_world, time_diff) => match world_iter.next() {
                     Some(new_world) => {
-                        current_case = a.chase_checkpoint_or_transition(new_world);
+                        current_case = Self::CheckpointReached(new_old_world, time_diff).chase_checkpoint_or_transition(new_world);
                     },
                     None => {
-                        return Some(RenderSource::Static(world));
+                        return Some(RenderSource::Static(new_old_world));
                     },
                 }
             }
@@ -229,40 +231,54 @@ impl Renderer {
 
 #[tokio::main]
 async fn main() {
-    // Systems setup
-    let mut world = World::default();
-    let (input_tx, input_rx) = mpsc::channel::<Input>();
-    let game_complete = AtomicBool::new(false);
-    let network_and_inputs = Netting::new();
+    let (netting, msg_rx) = netting::Netting::new().await;
 
-    // Begin running game systems...
-    thread::scope(|s| {
-        let actions_since_sync: Vec<UserAction> = vec![];
-        let worlds_since_sync: Vec<(Instant, World)> = vec![];
+    // We're running some tests for connecting, need to input thing.
+    use std::io::Stdin;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).unwrap();
+    let input = input.trim();
+    println!("Will attempt to connect to {input:?}...");
+    netting.create_peer_connection(input.parse().unwrap()).await;
 
-        let network_input_thread = s.spawn(|| loop {
-            if game_complete.load(Ordering::Relaxed) {
-                break;
-            }
+    loop {
+        // TODO Make this a "wait for everything to finish" thing instead of just sleeping.
+        tokio::time::sleep(Duration::milliseconds(50000).to_std().unwrap()).await;
+    }
+    // // Systems setup
+    // let mut world = World::default();
+    // let (input_tx, input_rx) = mpsc::channel::<Input>();
+    // let game_complete = AtomicBool::new(false);
+    // let network_and_inputs = Netting::new();
 
-            // Read user input, network events and rearrange them. Also manage periodic sync.
-            // Also ruthlessly kill connections if they haven't been around for a minute. Not
-            // sure how the game world will react to this, though.
-        });
+    // // Begin running game systems...
+    // thread::scope(|s| {
+    //     let actions_since_sync: Vec<UserAction> = vec![];
+    //     let worlds_since_sync: Vec<(DateTime<Utc>, World)> = vec![];
 
-        let main_thread = s.spawn(|| 'main_loop: loop {
-            'round_loop: loop {
-                match world.tick() {
-                    ControlFlow::Continue => {
-                    },
-                    ControlFlow::RoundComplete => {
-                        break 'round_loop;
-                    },
-                    ControlFlow::GameComplete => {
-                        break 'main_loop;
-                    },
-                }
-            } 
-        });
-    });
+    //     let network_input_thread = s.spawn(|| loop {
+    //         if game_complete.load(Ordering::Relaxed) {
+    //             break;
+    //         }
+
+    //         // Read user input, network events and rearrange them. Also manage periodic sync.
+    //         // Also ruthlessly kill connections if they haven't been around for a minute. Not
+    //         // sure how the game world will react to this, though.
+    //     });
+
+    //     let main_thread = s.spawn(|| 'main_loop: loop {
+    //         'round_loop: loop {
+    //             match world.tick() {
+    //                 ControlFlow::Continue => {
+    //                 },
+    //                 ControlFlow::RoundComplete => {
+    //                     break 'round_loop;
+    //                 },
+    //                 ControlFlow::GameComplete => {
+    //                     break 'main_loop;
+    //                 },
+    //             }
+    //         } 
+    //     });
+    // });
 }
