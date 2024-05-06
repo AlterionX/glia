@@ -538,7 +538,7 @@ impl PeerRegistryEntry {
                             // Skip entry since it's not a message
                             continue;
                         }
-                        trc::info!("NET-WRITE writing message... {i:?} <<>> {st_len:?} <<>> {:?}", SynapseTransmissionKind::from_discriminant(st_bytes[0]));
+                        trc::trace!("NET-WRITE writing message... {i:?} <<>> {st_len:?} <<>> {:?}", SynapseTransmissionKind::from_discriminant(st_bytes[0]));
                         // We're handling disconnected sockets by crashing... maybe
                         // I'll fix this in the future, but for now...
                         let sent = match socket.send_to(&st_bytes[..*st_len], addr) {
@@ -559,7 +559,7 @@ impl PeerRegistryEntry {
                         if st_bytes[0] == SynapseTransmissionKind::Ack.to_discriminant() {
                             *st_len = 0;
                         }
-                        trc::info!("NET-WRITE message written");
+                        trc::trace!("NET-WRITE message written");
                     }
                 }}
 
