@@ -231,11 +231,20 @@ impl Renderer {
 
 #[tokio::main]
 async fn main() {
+    let subscriber = tracing_subscriber::fmt()
+        .compact()
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_target(false)
+        .finish();
+    trc::subscriber::set_global_default(subscriber).expect("no issues setting up logging");
+
     let (netting, msg_rx) = netting::Netting::new().await;
 
     // We're running some tests for connecting, need to input thing.
-    use std::io::Stdin;
     let mut input = String::new();
+    println!("Connect to?");
     std::io::stdin().read_line(&mut input).unwrap();
     let input = input.trim();
     println!("Will attempt to connect to {input:?}...");
