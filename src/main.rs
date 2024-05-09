@@ -1,8 +1,10 @@
 mod netting;
 
-use std::{net::IpAddr, sync::{atomic::{AtomicBool, Ordering}, mpsc, Mutex}, thread};
+use std::net::IpAddr;
 
 use chrono::{Duration, DateTime, Utc};
+
+use crate::netting::{NettingMessageKind, NettingMessage};
 
 #[derive(Default)]
 pub enum Terrain {
@@ -246,9 +248,27 @@ async fn main() {
     let mut input = String::new();
     println!("Connect to?");
     std::io::stdin().read_line(&mut input).unwrap();
-    let input = input.trim();
-    println!("Will attempt to connect to {input:?}...");
-    netting.create_peer_connection(input.parse().unwrap()).await;
+    let addr = input.trim();
+    println!("Will attempt to connect to {addr:?}...");
+    netting.create_peer_connection(addr.parse().unwrap()).await;
+
+    println!("Connect to?");
+    input.truncate(0);
+    std::io::stdin().read_line(&mut input).unwrap();
+    let msg0 = input.trim();
+    netting.broadcast(msg0).await;
+
+    println!("Connect to?");
+    input.truncate(0);
+    std::io::stdin().read_line(&mut input).unwrap();
+    let msg1 = input.trim();
+    netting.broadcast(msg1).await;
+
+    println!("Connect to?");
+    input.truncate(0);
+    std::io::stdin().read_line(&mut input).unwrap();
+    let msg2 = input.trim();
+    netting.broadcast(msg2).await;
 
     loop {
         // TODO Make this a "wait for everything to finish" thing instead of just sleeping.
