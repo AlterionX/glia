@@ -7,7 +7,7 @@ use mio::{net::UdpSocket, Events, Interest, Poll, Token};
 use p256::{ecdh::EphemeralSecret, EncodedPoint, PublicKey};
 use rand::rngs::OsRng;
 use sha2::Digest;
-use tokio::{sync::{mpsc::{self, error::TryRecvError, Receiver, Sender}, RwLock}, task::JoinHandle};
+use tokio::{sync::{mpsc::{self, error::TryRecvError, Receiver, Sender}, Mutex, RwLock}, task::JoinHandle};
 
 use crate::{World, UserAction};
 
@@ -208,9 +208,6 @@ pub enum SocketMessage {
 
 pub struct PeerRegistryEntry {
     pub client_id: [u8; 9],
-    pub udp_synt_interop_task_handle: Option<JoinHandle<()>>,
-    pub netting_to_known_task_handle: Option<JoinHandle<()>>,
-    pub known_to_netting_task_handle: Option<JoinHandle<()>>,
     pub local_addr: SocketAddr,
 }
 
@@ -538,7 +535,6 @@ impl PeerRegistryEntry {
         ]
     }
 
-    const OWN_PORT: Token = Token(0);
     /// Starts up the current machine's networking.
     ///
     /// The synapse-level work will handle connection negotiation and
@@ -546,19 +542,47 @@ impl PeerRegistryEntry {
     ///
     /// Higher level systems will defrag synapse transmissions into netting
     /// messages that have actual game data.
-    pub async fn mine() -> (
-        Self,
-        Sender<(NettingMessage, Option<SocketAddr>)>,
-        Receiver<NettingMessage>,
-        Sender<OutboundSynapseTransmission>,
-    ) {
+    pub async fn mine() -> (Self, UdpSocket) {
         let client_id = Self::client_id_gen();
-        trc::info!("Client ID: {client_id:?}");
+        trc::info!("NET-INIT Own Client ID: {client_id:?}");
 
         // Determine which port we're using to look at the world.
-        let mut socket = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         // TODO Run STUN here to figure out true ip/port. This is what will be sent in the future
         let local_addr = socket.local_addr().unwrap();
+
+        (Self {
+            client_id,
+            local_addr,
+        }, socket)
+    }
+}
+
+pub struct PeerRegistry {
+    // Reference to send/recv socket is hidden.
+    pub me: PeerRegistryEntry,
+
+    // Registry processes.
+    pub udp_synt_interop_task_handle: JoinHandle<()>,
+    pub netting_to_known_task_handle: JoinHandle<()>,
+    pub known_to_netting_task_handle: JoinHandle<()>,
+    pub peer_connected_task_handle: JoinHandle<()>,
+
+    pub siblings: Arc<RwLock<Vec<PeerRegistryEntry>>>,
+}
+
+impl PeerRegistry {
+    const OWN_PORT: Token = Token(0);
+    // Returns a receiver for so that the owner of the registry can trigger a new peer connection.
+    pub async fn new() -> (
+        Self,
+        Receiver<NettingMessage>,
+        Sender<OutboundSynapseTransmission>,
+        Sender<(NettingMessage, Option<SocketAddr>)>,
+    ) {
+        let (me, mut socket) = PeerRegistryEntry::mine().await;
+        let siblings = Arc::new(RwLock::new(Vec::new()));
+        trc::info!("NET-INIT Connector port opened {:?}", me.local_addr);
 
         let mut poll = Poll::new().unwrap();
         let mut events = Events::with_capacity(1024);
@@ -573,6 +597,9 @@ impl PeerRegistryEntry {
         let (external_osynt_tx, mut osynt_rx) = mpsc::channel(1024);
         let internal_osynt_tx = external_osynt_tx.clone();
 
+        let (connection_notification_tx, mut connection_notification_rx) = mpsc::channel(10);
+
+        let own_client_id = me.client_id;
         let udp_synt_interop_task_handle = tokio::spawn(async move {
             poll.registry().register(&mut socket, Self::OWN_PORT, Interest::READABLE | Interest::WRITABLE).unwrap();
             let mut dg_buf_mem = [0u8; MAX_UDP_DG_SIZE];
@@ -629,6 +656,7 @@ impl PeerRegistryEntry {
                     };
 
                     match isynt.kind {
+                        // [5 bytes; hello][9 bytes client id][remainder; peer_secret]
                         SynapseTransmissionKind::HandshakeInitiate => 'initiate_end: {
                             let connection_data = connections.entry(sender_addr).or_default();
                             if connection_data.recently_received(&isynt, checksum.to_vec()) {
@@ -639,8 +667,30 @@ impl PeerRegistryEntry {
                                 trc::debug!("NET-ISYNT-HANDSHAKE-INIT connection from {sender_addr:?} rejected");
                                 break 'initiate_end;
                             }
+
+                            // TODO eventually sign this? It's not a problem for an attacker to
+                            // know our client id, I don't think...
+                            if isynt.bytes.len() < b"hello".len() + own_client_id.len() {
+                                break 'initiate_end;
+                            }
+                            let peer_client_id_bytes = &isynt.bytes[b"hello".len()..][..own_client_id.len()];
+                            let peer_client_id = [
+                                peer_client_id_bytes[0],
+                                peer_client_id_bytes[1],
+                                peer_client_id_bytes[2],
+                                peer_client_id_bytes[3],
+                                peer_client_id_bytes[4],
+                                peer_client_id_bytes[5],
+                                peer_client_id_bytes[6],
+                                peer_client_id_bytes[7],
+                                peer_client_id_bytes[8],
+                            ];
+                            let peer_public_bytes = &isynt.bytes[b"hello".len()..][own_client_id.len()..];
+
+                            let mut outbound_buffer = vec![0u8; MAX_UDP_DG_SIZE];
+
                             trc::info!("NET-ISYNT-HANDSHAKE-INIT receiver ecdh init");
-                            let peer_public = PublicKey::from_sec1_bytes(isynt.bytes.as_slice()).unwrap();
+                            let peer_public = PublicKey::from_sec1_bytes(peer_public_bytes).unwrap();
                             let own_secret = EphemeralSecret::random(&mut OsRng);
                             let own_private = EncodedPoint::from(own_secret.public_key());
                             let own_public = PublicKey::from_sec1_bytes(own_private.as_ref()).unwrap();
@@ -649,24 +699,49 @@ impl PeerRegistryEntry {
                             // Now queue up response.
                             let handshake_internal_output_message_tx = internal_osynt_tx.clone();
                             let combined_key = PeerKey::exchanged_from_shared_secret(shared_key);
-                            { // TODO Delete this and send the encrypted message across the wire so
-                              // that it can be verified. If it's "bad" somehow, we'll delete it.
-                                let mut buffer = vec![0u8; 512];
-                                let ciphertext_length = combined_key.fixed_nonce_aead_encrypt(&[1; 24], b"hello", buffer.as_mut_slice());
-                                buffer.resize(ciphertext_length, 0);
-                                trc::info!("NET-ISYNT-HANDSHAKE-INIT sample encrypted: {:?}", buffer);
-                            };
+                            { // TODO Implement a permissioning system.
+                                // We'll write out the client id so that the exchange will also
+                                // record the client id.
+                                trc::debug!("NET-ISYNT-HANDSHAKE-INIT key minted");
+                                let public_bytes = own_public.to_sec1_bytes();
+                                let message = b"hello".iter().copied().chain(own_client_id.iter().copied()).collect::<Vec<_>>();
+                                let encrypted_bytes = combined_key.aead_encrypt(&message, &mut outbound_buffer[8..]);
+                                outbound_buffer[..8].copy_from_slice(&encrypted_bytes.to_be_bytes());
+                                outbound_buffer[8..][encrypted_bytes..][..public_bytes.len()].copy_from_slice(&public_bytes);
+                                outbound_buffer.truncate(encrypted_bytes + 8 + public_bytes.len());
+                            }
                             connection_data.exchanged_key = Some(combined_key);
 
                             ack_fut.await.expect("no issues sending ack");
                             handshake_internal_output_message_tx.send(OutboundSynapseTransmission {
                                 kind: OutboundSynapseTransmissionKind::HandshakeResponse,
-                                bytes: own_public.to_sec1_bytes().to_vec(),
+                                bytes: outbound_buffer,
                                 maybe_target_address: Some(sender_addr),
                             }).await.expect("channel to not be closed");
+                            connection_notification_tx.send((peer_client_id, sender_addr)).await.expect("rx to be present");
                         },
+                        // TODO Make the HandshakeResponse send another packet to confirm.
+                        // [8 bytes; mlen][mlen bytes; ciphertext][remainder; peer_secret]
                         SynapseTransmissionKind::HandshakeResponse => 'response_end: {
-                            let peer_public_bytes = isynt.bytes.as_slice();
+                            if isynt.bytes.len() < 8 {
+                                break 'response_end;
+                            }
+                            let mlen = u64::from_be_bytes([
+                                isynt.bytes[0],
+                                isynt.bytes[1],
+                                isynt.bytes[2],
+                                isynt.bytes[3],
+                                isynt.bytes[4],
+                                isynt.bytes[5],
+                                isynt.bytes[6],
+                                isynt.bytes[7],
+                            ]) as usize;
+                            if isynt.bytes.len() < 8 + mlen {
+                                break 'response_end;
+                            }
+                            let ciphertext = &isynt.bytes[8..][..mlen];
+                            let peer_public_bytes = &isynt.bytes[8..][mlen..];
+
                             let Some(connection_data) = connections.get_mut(&sender_addr) else {
                                 trc::debug!("NET-ISYNT-HANDSHAKE-RESP rejected -- not initiated");
                                 // We have not initiated this connection, this
@@ -689,16 +764,36 @@ impl PeerRegistryEntry {
                             let peer_public = PublicKey::from_sec1_bytes(peer_public_bytes).unwrap();
                             let shared_key = own_secret.diffie_hellman(&peer_public);
                             let combined_key = PeerKey::exchanged_from_shared_secret(shared_key);
-                            { // TODO Delete this and send the encrypted message across the wire so
-                              // that it can be verified. If it's "bad" somehow, we'll send a
-                              // disconnect.
-                                let mut buffer = vec![0u8; 512];
-                                let ciphertext_length = combined_key.fixed_nonce_aead_encrypt(&[1; 24], b"hello", buffer.as_mut_slice());
-                                buffer.resize(ciphertext_length, 0);
-                                trc::info!("NET-ISYNT-HANDSHAKE-RESP sample encrypted: {:?}", buffer);
+
+                            // Now use the combined key.
+                            let Some(peer_client_id_and_greeting) = combined_key.aead_decrypt(ciphertext) else {
+                                // Bad packet, deny.
+                                break 'response_end;
                             };
+                            if peer_client_id_and_greeting.len() != b"hello".len() + own_client_id.len() {
+                                // Bad packet, deny.
+                                break 'response_end;
+                            }
+                            if &peer_client_id_and_greeting[..b"hello".len()] != b"hello" {
+                                // Bad packet, deny.
+                                break 'response_end;
+                            }
+                            let peer_client_id_bytes = &peer_client_id_and_greeting[b"hello".len()..];
+                            let peer_client_id = [
+                                peer_client_id_bytes[0],
+                                peer_client_id_bytes[1],
+                                peer_client_id_bytes[2],
+                                peer_client_id_bytes[3],
+                                peer_client_id_bytes[4],
+                                peer_client_id_bytes[5],
+                                peer_client_id_bytes[6],
+                                peer_client_id_bytes[7],
+                                peer_client_id_bytes[8],
+                            ];
+
                             connection_data.exchanged_key = Some(combined_key);
                             trc::debug!("NET-ISYNT-HANDSHAKE-RESP complete");
+                            connection_notification_tx.send((peer_client_id, sender_addr)).await.expect("rx to be present");
 
                             ack_fut.await.expect("no issues sending ack");
                         },
@@ -742,6 +837,7 @@ impl PeerRegistryEntry {
                             tx_no as u8
                         ], addr).expect("socket to be okay");
                     }
+                    // TODO this should back off from time to time
                     for (i, (&addr, (st_len, st_bytes))) in connections.iter_mut().flat_map(|(addr, data)| data.active_messages.iter_mut().map(move |active_message| (addr, active_message)).enumerate()) {
                         if *st_len == 0 {
                             // Skip entry since it's not a message
@@ -810,7 +906,13 @@ impl PeerRegistryEntry {
                             let own_public = PublicKey::from_sec1_bytes(own_private.as_ref()).unwrap();
                             connection_data.exchanged_key = Some(PeerKey::Inflight(own_secret));
                             trc::debug!("NET-OSYNT-HANDSHAKE-INIT complete!");
-                            (false, own_public.to_sec1_bytes().to_vec())
+                            // TODO sign these bytes
+                            let greeting_bytes =
+                                b"hello".iter().copied()
+                                .chain(own_client_id.iter().copied())
+                                .chain(own_public.to_sec1_bytes().iter().copied())
+                                .collect();
+                            (false, greeting_bytes)
                         },
                         OutboundSynapseTransmissionKind::HandshakeResponse => {
                             trc::info!("NOT-OSYNT-HANDSHAKE-RESP sending");
@@ -905,36 +1007,26 @@ impl PeerRegistryEntry {
             }
         });
 
-        (Self {
-            client_id,
-            udp_synt_interop_task_handle: Some(udp_synt_interop_task_handle),
-            netting_to_known_task_handle: Some(netting_to_known_task_handle),
-            known_to_netting_task_handle: Some(known_to_netting_task_handle),
-            local_addr,
-        }, outbound_netting_tx, inbound_netting_rx, external_osynt_tx)
-    }
-}
-
-pub struct PeerRegistry {
-    // Reference to send/recv socket is hidden.
-    pub me: PeerRegistryEntry,
-    pub siblings: Vec<PeerRegistryEntry>,
-}
-
-impl PeerRegistry {
-    // Returns a receiver for so that the owner of the registry can trigger a new peer connection.
-    pub async fn new() -> (
-        Self,
-        Receiver<NettingMessage>,
-        Sender<OutboundSynapseTransmission>,
-        Sender<(NettingMessage, Option<SocketAddr>)>,
-    ) {
-        let (me, outbound_netting_tx, inbound_netting_rx, osynt_tx) = PeerRegistryEntry::mine().await;
-        trc::info!("Connector port opened {:?}", me.local_addr);
+        let siblings_ref = Arc::clone(&siblings);
+        let peer_connected_task_handle = tokio::spawn(async move {
+            loop {
+                let Some((peer_id, addr)) = connection_notification_rx.recv().await else {
+                    continue;
+                };
+                siblings_ref.write().await.push(PeerRegistryEntry {
+                    client_id: peer_id,
+                    local_addr: addr,
+                });
+            }
+        });
 
         (Self {
             me,
-            siblings: vec![],
-        }, inbound_netting_rx, osynt_tx, outbound_netting_tx)
+            udp_synt_interop_task_handle,
+            netting_to_known_task_handle,
+            known_to_netting_task_handle,
+            peer_connected_task_handle,
+            siblings,
+        }, inbound_netting_rx, external_osynt_tx, outbound_netting_tx)
     }
 }
