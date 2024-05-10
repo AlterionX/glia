@@ -1,22 +1,60 @@
 use std::{alloc::Layout, collections::HashMap, net::SocketAddr, pin::Pin, sync::Arc};
 
-use chacha::{aead::{Aead, Buffer}, AeadCore, KeyInit};
-use chrono::{DateTime, TimeDelta, Utc};
+use chacha::{aead::Aead, AeadCore, KeyInit};
+use chrono::{TimeDelta, Utc};
 use derivative::Derivative;
 use mio::{net::UdpSocket, Events, Interest, Poll, Token};
 use p256::{ecdh::EphemeralSecret, EncodedPoint, PublicKey};
 use rand::rngs::OsRng;
 use sha2::Digest;
-use tokio::{sync::{mpsc::{self, error::TryRecvError, Receiver, Sender}, Mutex, RwLock}, task::JoinHandle};
+use tokio::{sync::{mpsc::{self, error::TryRecvError, Receiver, Sender}, RwLock}, task::JoinHandle};
 
 use crate::{World, UserAction};
 
 const MAX_UDP_DG_SIZE: usize = 65_535;
 const MAX_KNOWN_PACKET_LEN: usize = MAX_UDP_DG_SIZE / 2;
 
+#[derive(Debug, Clone, Copy)]
+pub struct ClientId([u8; ClientId::LEN]);
+
+impl ClientId {
+    const LEN: usize = 9;
+
+    fn gen() -> Self {
+        // While this doesn't guarantee name uniqueness (we'd need a PhD for that shit) this is
+        // probably good enough for any reasonable person. It's highly unlikely for two clients to
+        // be created at the same millisecond (we're talking O(5) here) and even then, the chaos
+        // determinant is for 256.
+        //
+        // I really don't want to re-negotiate names.
+        //
+        // Also, this particular random number isn't persisted and we shouldn't rely on this being
+        // fixed between saves/sessions.
+        let time_component = Utc::now().timestamp_millis().to_be_bytes();
+        let chaos_determinant = [rand::random::<u8>()];
+        // Network order (big endian) bytes -- 9 bytes!
+        debug_assert_eq!(time_component.len() + chaos_determinant.len(), 9);
+        Self([
+            time_component[0],
+            time_component[1],
+            time_component[2],
+            time_component[3],
+            time_component[4],
+            time_component[5],
+            time_component[6],
+            time_component[7],
+            chaos_determinant[0]
+        ])
+    }
+
+    fn iter<'a>(&'a self) -> impl Iterator<Item=u8> + 'a {
+        self.0.iter().copied()
+    }
+}
+
 /// Struct holding network connections
 pub struct Netting {
-    pub registry: Arc<RwLock<PeerRegistry>>,
+    pub registry: PeerRegistry,
     force_osynt_tx: Sender<OutboundSynapseTransmission>,
     netting_tx: Sender<(NettingMessage, Option<SocketAddr>)>,
 }
@@ -25,8 +63,7 @@ impl Netting {
     // TODO This should probably be yet another event.
     pub async fn new() -> (Self, Receiver<NettingMessage>) {
         // TODO Actually use these
-        let (inner_registry, netting_rx, force_osynt_tx, netting_tx) = PeerRegistry::new().await;
-        let registry = Arc::new(RwLock::new(inner_registry));
+        let (registry, netting_rx, force_osynt_tx, netting_tx) = PeerRegistry::new().await;
 
         (Self {
             registry,
@@ -35,6 +72,7 @@ impl Netting {
         }, netting_rx)
     }
 
+    // TODO Make this return the client id of the peer.
     pub async fn create_peer_connection(&self, addr: SocketAddr) {
         self.force_osynt_tx.send(OutboundSynapseTransmission {
             kind: OutboundSynapseTransmissionKind::HandshakeInitiate,
@@ -49,6 +87,13 @@ impl Netting {
             .await
             .expect("no issues sending");
     }
+
+    pub async fn send_to(&self, msg: &str, peer: ClientId) {
+        self.netting_tx
+            .send((NettingMessageKind::NakedLogString(msg.to_owned()).to_msg(), None))
+            .await
+            .expect("no issues sending");
+    }
 }
 
 #[derive(Debug)]
@@ -58,7 +103,7 @@ pub enum NettingMessageKind {
     Handshake,
     NewConnection(SocketAddr),
     DroppedConnection {
-        client_id: [u8; 9],
+        client_id: ClientId,
     },
     WorldTransfer(Box<World>),
     User(UserAction),
@@ -96,7 +141,7 @@ impl NettingMessageKind {
             0 => Self::Noop,
             1 => Self::Handshake,
             2 => Self::NewConnection(unimplemented!("wat")),
-            3 => Self::DroppedConnection { client_id: bytes.try_into().unwrap() },
+            3 => Self::DroppedConnection { client_id: ClientId(bytes.try_into().unwrap()) },
             4 => Self::WorldTransfer(unimplemented!("wat")),
             5 => Self::User(unimplemented!("wat")),
             6 => {
@@ -207,7 +252,7 @@ pub enum SocketMessage {
 }
 
 pub struct PeerRegistryEntry {
-    pub client_id: [u8; 9],
+    pub client_id: ClientId,
     pub local_addr: SocketAddr,
 }
 
@@ -508,33 +553,6 @@ impl PeerConnectionData {
 }
 
 impl PeerRegistryEntry {
-    fn client_id_gen() -> [u8; 9] {
-        // While this doesn't guarantee name uniqueness (we'd need a PhD for that shit) this is
-        // probably good enough for any reasonable person. It's highly unlikely for two clients to
-        // be created at the same millisecond (we're talking O(5) here) and even then, the chaos
-        // determinant is for 256.
-        //
-        // I really don't want to re-negotiate names.
-        //
-        // Also, this particular random number isn't persisted and we shouldn't rely on this being
-        // fixed between saves/sessions.
-        let time_component = Utc::now().timestamp_millis().to_be_bytes();
-        let chaos_determinant = [rand::random::<u8>()];
-        // Network order (big endian) bytes -- 9 bytes!
-        debug_assert_eq!(time_component.len() + chaos_determinant.len(), 9);
-        [
-            time_component[0],
-            time_component[1],
-            time_component[2],
-            time_component[3],
-            time_component[4],
-            time_component[5],
-            time_component[6],
-            time_component[7],
-            chaos_determinant[0]
-        ]
-    }
-
     /// Starts up the current machine's networking.
     ///
     /// The synapse-level work will handle connection negotiation and
@@ -543,7 +561,7 @@ impl PeerRegistryEntry {
     /// Higher level systems will defrag synapse transmissions into netting
     /// messages that have actual game data.
     pub async fn mine() -> (Self, UdpSocket) {
-        let client_id = Self::client_id_gen();
+        let client_id = ClientId::gen();
         trc::info!("NET-INIT Own Client ID: {client_id:?}");
 
         // Determine which port we're using to look at the world.
@@ -670,10 +688,10 @@ impl PeerRegistry {
 
                             // TODO eventually sign this? It's not a problem for an attacker to
                             // know our client id, I don't think...
-                            if isynt.bytes.len() < b"hello".len() + own_client_id.len() {
+                            if isynt.bytes.len() < b"hello".len() + ClientId::LEN {
                                 break 'initiate_end;
                             }
-                            let peer_client_id_bytes = &isynt.bytes[b"hello".len()..][..own_client_id.len()];
+                            let peer_client_id_bytes = &isynt.bytes[b"hello".len()..][..ClientId::LEN];
                             let peer_client_id = [
                                 peer_client_id_bytes[0],
                                 peer_client_id_bytes[1],
@@ -685,7 +703,7 @@ impl PeerRegistry {
                                 peer_client_id_bytes[7],
                                 peer_client_id_bytes[8],
                             ];
-                            let peer_public_bytes = &isynt.bytes[b"hello".len()..][own_client_id.len()..];
+                            let peer_public_bytes = &isynt.bytes[b"hello".len()..][ClientId::LEN..];
 
                             let mut outbound_buffer = vec![0u8; MAX_UDP_DG_SIZE];
 
@@ -704,7 +722,7 @@ impl PeerRegistry {
                                 // record the client id.
                                 trc::debug!("NET-ISYNT-HANDSHAKE-INIT key minted");
                                 let public_bytes = own_public.to_sec1_bytes();
-                                let message = b"hello".iter().copied().chain(own_client_id.iter().copied()).collect::<Vec<_>>();
+                                let message = b"hello".iter().copied().chain(own_client_id.iter()).collect::<Vec<_>>();
                                 let encrypted_bytes = combined_key.aead_encrypt(&message, &mut outbound_buffer[8..]);
                                 outbound_buffer[..8].copy_from_slice(&encrypted_bytes.to_be_bytes());
                                 outbound_buffer[8..][encrypted_bytes..][..public_bytes.len()].copy_from_slice(&public_bytes);
@@ -770,7 +788,7 @@ impl PeerRegistry {
                                 // Bad packet, deny.
                                 break 'response_end;
                             };
-                            if peer_client_id_and_greeting.len() != b"hello".len() + own_client_id.len() {
+                            if peer_client_id_and_greeting.len() != b"hello".len() + ClientId::LEN {
                                 // Bad packet, deny.
                                 break 'response_end;
                             }
@@ -909,7 +927,7 @@ impl PeerRegistry {
                             // TODO sign these bytes
                             let greeting_bytes =
                                 b"hello".iter().copied()
-                                .chain(own_client_id.iter().copied())
+                                .chain(own_client_id.iter())
                                 .chain(own_public.to_sec1_bytes().iter().copied())
                                 .collect();
                             (false, greeting_bytes)
@@ -1014,7 +1032,7 @@ impl PeerRegistry {
                     continue;
                 };
                 siblings_ref.write().await.push(PeerRegistryEntry {
-                    client_id: peer_id,
+                    client_id: ClientId(peer_id),
                     local_addr: addr,
                 });
             }
