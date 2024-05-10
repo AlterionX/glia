@@ -15,7 +15,7 @@ const MAX_UDP_DG_SIZE: usize = 65_535;
 const MAX_KNOWN_PACKET_LEN: usize = MAX_UDP_DG_SIZE / 2;
 const HANDSHAKE_GREETING: &[u8] = b"hello";
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClientId([u8; ClientId::LEN]);
 
 impl ClientId {
@@ -108,10 +108,13 @@ impl Netting {
     }
 
     pub async fn send_to(&self, msg: &str, peer: ClientId) {
-        self.netting_tx
-            .send((NettingMessageKind::NakedLogString(msg.to_owned()).to_msg(), None))
-            .await
-            .expect("no issues sending");
+        let Some(socket_addr) = self.registry.find_socket_for(peer).await else {
+            return;
+        };
+        self.netting_tx.send((
+            NettingMessageKind::NakedLogString(msg.to_owned()).to_msg(),
+            Some(socket_addr),
+        )).await.expect("no issues sending");
     }
 }
 
@@ -1055,5 +1058,13 @@ impl PeerRegistry {
             peer_connected_task_handle,
             siblings,
         }, inbound_netting_rx, external_osynt_tx, outbound_netting_tx)
+    }
+
+    pub async fn find_socket_for(&self, peer: ClientId) -> Option<SocketAddr> {
+        if peer == self.me.client_id {
+            // TODO Consider actually sending a message to self.
+            return None;
+        }
+        self.siblings.read().await.iter().find(|s| s.client_id == peer).map(|s| s.local_addr)
     }
 }
