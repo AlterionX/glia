@@ -13,6 +13,7 @@ use crate::{World, UserAction};
 
 const MAX_UDP_DG_SIZE: usize = 65_535;
 const MAX_KNOWN_PACKET_LEN: usize = MAX_UDP_DG_SIZE / 2;
+const HANDSHAKE_GREETING: &[u8] = b"hello";
 
 #[derive(Debug, Clone, Copy)]
 pub struct ClientId([u8; ClientId::LEN]);
@@ -49,6 +50,24 @@ impl ClientId {
 
     fn iter<'a>(&'a self) -> impl Iterator<Item=u8> + 'a {
         self.0.iter().copied()
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::LEN {
+            return None;
+        }
+
+        Some(Self([
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3],
+            bytes[4],
+            bytes[5],
+            bytes[6],
+            bytes[7],
+            bytes[8],
+        ]))
     }
 }
 
@@ -688,22 +707,12 @@ impl PeerRegistry {
 
                             // TODO eventually sign this? It's not a problem for an attacker to
                             // know our client id, I don't think...
-                            if isynt.bytes.len() < b"hello".len() + ClientId::LEN {
+                            if isynt.bytes.len() < HANDSHAKE_GREETING.len() + ClientId::LEN {
                                 break 'initiate_end;
                             }
-                            let peer_client_id_bytes = &isynt.bytes[b"hello".len()..][..ClientId::LEN];
-                            let peer_client_id = [
-                                peer_client_id_bytes[0],
-                                peer_client_id_bytes[1],
-                                peer_client_id_bytes[2],
-                                peer_client_id_bytes[3],
-                                peer_client_id_bytes[4],
-                                peer_client_id_bytes[5],
-                                peer_client_id_bytes[6],
-                                peer_client_id_bytes[7],
-                                peer_client_id_bytes[8],
-                            ];
-                            let peer_public_bytes = &isynt.bytes[b"hello".len()..][ClientId::LEN..];
+                            let peer_client_id_bytes = &isynt.bytes[HANDSHAKE_GREETING.len()..][..ClientId::LEN];
+                            let peer_client_id = ClientId::from_bytes(peer_client_id_bytes).expect("parsing to work");
+                            let peer_public_bytes = &isynt.bytes[HANDSHAKE_GREETING.len()..][ClientId::LEN..];
 
                             let mut outbound_buffer = vec![0u8; MAX_UDP_DG_SIZE];
 
@@ -722,7 +731,7 @@ impl PeerRegistry {
                                 // record the client id.
                                 trc::debug!("NET-ISYNT-HANDSHAKE-INIT key minted");
                                 let public_bytes = own_public.to_sec1_bytes();
-                                let message = b"hello".iter().copied().chain(own_client_id.iter()).collect::<Vec<_>>();
+                                let message = HANDSHAKE_GREETING.iter().copied().chain(own_client_id.iter()).collect::<Vec<_>>();
                                 let encrypted_bytes = combined_key.aead_encrypt(&message, &mut outbound_buffer[8..]);
                                 outbound_buffer[..8].copy_from_slice(&encrypted_bytes.to_be_bytes());
                                 outbound_buffer[8..][encrypted_bytes..][..public_bytes.len()].copy_from_slice(&public_bytes);
@@ -788,16 +797,16 @@ impl PeerRegistry {
                                 // Bad packet, deny.
                                 break 'response_end;
                             };
-                            if peer_client_id_and_greeting.len() != b"hello".len() + ClientId::LEN {
+                            if peer_client_id_and_greeting.len() != HANDSHAKE_GREETING.len() + ClientId::LEN {
                                 // Bad packet, deny.
                                 break 'response_end;
                             }
-                            if &peer_client_id_and_greeting[..b"hello".len()] != b"hello" {
+                            if &peer_client_id_and_greeting[..HANDSHAKE_GREETING.len()] != HANDSHAKE_GREETING {
                                 // Bad packet, deny.
                                 break 'response_end;
                             }
-                            let peer_client_id_bytes = &peer_client_id_and_greeting[b"hello".len()..];
-                            let peer_client_id = [
+                            let peer_client_id_bytes = &peer_client_id_and_greeting[HANDSHAKE_GREETING.len()..];
+                            let peer_client_id = ClientId([
                                 peer_client_id_bytes[0],
                                 peer_client_id_bytes[1],
                                 peer_client_id_bytes[2],
@@ -807,7 +816,7 @@ impl PeerRegistry {
                                 peer_client_id_bytes[6],
                                 peer_client_id_bytes[7],
                                 peer_client_id_bytes[8],
-                            ];
+                            ]);
 
                             connection_data.exchanged_key = Some(combined_key);
                             trc::debug!("NET-ISYNT-HANDSHAKE-RESP complete");
@@ -926,7 +935,7 @@ impl PeerRegistry {
                             trc::debug!("NET-OSYNT-HANDSHAKE-INIT complete!");
                             // TODO sign these bytes
                             let greeting_bytes =
-                                b"hello".iter().copied()
+                                HANDSHAKE_GREETING.iter().copied()
                                 .chain(own_client_id.iter())
                                 .chain(own_public.to_sec1_bytes().iter().copied())
                                 .collect();
@@ -1032,7 +1041,7 @@ impl PeerRegistry {
                     continue;
                 };
                 siblings_ref.write().await.push(PeerRegistryEntry {
-                    client_id: ClientId(peer_id),
+                    client_id: peer_id,
                     local_addr: addr,
                 });
             }
