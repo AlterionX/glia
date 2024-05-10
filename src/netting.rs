@@ -1,6 +1,6 @@
 use std::{alloc::Layout, collections::HashMap, net::SocketAddr, pin::Pin, sync::Arc};
 
-use chacha::{AeadCore, KeyInit, aead::Aead};
+use chacha::{aead::{Aead, Buffer}, AeadCore, KeyInit};
 use chrono::{DateTime, TimeDelta, Utc};
 use derivative::Derivative;
 use mio::{net::UdpSocket, Events, Interest, Poll, Token};
@@ -12,66 +12,49 @@ use tokio::{sync::{mpsc::{self, error::TryRecvError, Receiver, Sender}, RwLock},
 use crate::{World, UserAction};
 
 const MAX_UDP_DG_SIZE: usize = 65_535;
+const MAX_KNOWN_PACKET_LEN: usize = MAX_UDP_DG_SIZE / 2;
 
 /// Struct holding network connections
 pub struct Netting {
     pub registry: Arc<RwLock<PeerRegistry>>,
-    force_conn_tx: Sender<SocketAddr>,
     force_osynt_tx: Sender<OutboundSynapseTransmission>,
-    netting_tx: Sender<(NettingMessage, SocketAddr)>,
+    netting_tx: Sender<(NettingMessage, Option<SocketAddr>)>,
 }
 
 impl Netting {
     // TODO This should probably be yet another event.
-    pub async fn new() -> (Self, Receiver<UserAction>) {
+    pub async fn new() -> (Self, Receiver<NettingMessage>) {
         // TODO Actually use these
-        let (input_tx, input_rx) = mpsc::channel::<UserAction>(512);
-
-        let (force_conn_tx, force_conn_rx) = mpsc::channel::<SocketAddr>(512);
-        let (inner_registry, mut new_connection_trigger, force_osynt_tx, netting_tx) = PeerRegistry::new(force_conn_rx).await;
+        let (inner_registry, netting_rx, force_osynt_tx, netting_tx) = PeerRegistry::new().await;
         let registry = Arc::new(RwLock::new(inner_registry));
-
-        // Now, let's properly handle that new connection call.
-        let new_connection_synapse_transmission_tx = force_osynt_tx.clone();
-        let new_connection_registry = Arc::clone(&registry);
-        tokio::spawn(async move {
-            loop {
-                let Some(addr) = new_connection_trigger.recv().await else {
-                    // TODO Repair fiber.
-                    break;
-                };
-                trc::info!("Attempting connection to {addr:?}");
-                new_connection_synapse_transmission_tx.send(OutboundSynapseTransmission {
-                    kind: OutboundSynapseTransmissionKind::HandshakeInitiate,
-                    bytes: vec![],
-                    maybe_target_address: Some(addr),
-                }).await.expect("handle this properly");
-            }
-        });
 
         (Self {
             registry,
-            force_conn_tx,
             force_osynt_tx,
             netting_tx,
-        }, input_rx)
+        }, netting_rx)
     }
 
     pub async fn create_peer_connection(&self, addr: SocketAddr) {
-        self.force_conn_tx.send(addr).await.unwrap()
+        self.force_osynt_tx.send(OutboundSynapseTransmission {
+            kind: OutboundSynapseTransmissionKind::HandshakeInitiate,
+            bytes: vec![],
+            maybe_target_address: Some(addr),
+        }).await.expect("no issues sending");
     }
 
     pub async fn broadcast(&self, msg: &str) {
-        self.force_osynt_tx.send(OutboundSynapseTransmission {
-            kind: OutboundSynapseTransmissionKind::KnownPacket,
-            bytes: msg.bytes().collect(),
-            maybe_target_address: None,
-        }).await.expect("no issues sending");
+        self.netting_tx
+            .send((NettingMessageKind::NakedLogString(msg.to_owned()).to_msg(), None))
+            .await
+            .expect("no issues sending");
     }
 }
 
+#[derive(Debug)]
 pub enum NettingMessageKind {
     Noop,
+    NakedLogString(String),
     Handshake,
     NewConnection(SocketAddr),
     DroppedConnection {
@@ -86,17 +69,121 @@ impl NettingMessageKind {
 
     pub fn to_msg(self) -> NettingMessage {
         NettingMessage {
-            packet_id: Utc::now().timestamp_millis().to_string(),
-            time: Utc::now(),
+            message_id: Utc::now().timestamp_millis() as u64,
             kind: self,
+        }
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Noop => vec![0],
+            Self::Handshake => vec![1],
+            Self::NewConnection(_addr) => vec![2],
+            Self::DroppedConnection { client_id: _ } => vec![3],
+            Self::WorldTransfer(_w) => vec![4],
+            Self::User(_u) => vec![5],
+            Self::NakedLogString(log_str) => {
+                let mut v = log_str.into_bytes();
+                v.push(6);
+                v
+            },
+        }
+    }
+
+    // TODO make this return Result instead of unwrapping
+    pub fn parse(mut bytes: Vec<u8>) -> Self {
+        match bytes.last().expect("bytes should not be empty") {
+            0 => Self::Noop,
+            1 => Self::Handshake,
+            2 => Self::NewConnection(unimplemented!("wat")),
+            3 => Self::DroppedConnection { client_id: bytes.try_into().unwrap() },
+            4 => Self::WorldTransfer(unimplemented!("wat")),
+            5 => Self::User(unimplemented!("wat")),
+            6 => {
+                bytes.pop();
+                Self::NakedLogString(String::from_utf8(bytes).expect("only string passed"))
+            },
+            e => unimplemented!("unknown netting message kind discriminant {e:?}"),
         }
     }
 }
 
+#[derive(Debug)]
+pub struct NettingMessageBytesWithOrdering {
+    pub packet_index: u8,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum NettingMessageParseError {
+    PartialMessage {
+        message_id: u64,
+        expected_len: u64,
+        msg: NettingMessageBytesWithOrdering
+    },
+}
+
+#[derive(Debug)]
 pub struct NettingMessage {
-    pub packet_id: String,
-    pub time: DateTime<Utc>,
+    pub message_id: u64,
     pub kind: NettingMessageKind,
+}
+
+impl NettingMessage {
+    pub fn into_known_packet_bytes(self) -> Vec<Vec<u8>> {
+        let unfettered_bytes = self.kind.into_bytes();
+        let common_header: Vec<_> = (unfettered_bytes.len() as u64).to_be_bytes().into_iter().chain(self.message_id.to_be_bytes().into_iter()).collect();
+        // We expect max of u8::MAX packets. Give up otherwise
+        assert!(unfettered_bytes.len() / (u8::MAX as usize) < MAX_KNOWN_PACKET_LEN, "netting message too big for protocol");
+        let chunk_size = MAX_KNOWN_PACKET_LEN - common_header.len() - 1;
+        let mut assembled_packets = Vec::with_capacity((unfettered_bytes.len() + chunk_size - 1) / chunk_size);
+        for (i, chunk) in unfettered_bytes.chunks(chunk_size).enumerate() {
+            let assembled_packet: Vec<_> = common_header.iter().copied().chain(std::iter::once(i as u8)).chain(chunk.into_iter().copied()).collect();
+            assembled_packets.push(assembled_packet);
+        }
+        assembled_packets
+    }
+
+    pub fn parse(mut bytes: Vec<u8>) -> Result<NettingMessage, NettingMessageParseError> {
+        let expected_msg_len = u64::from_be_bytes([
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3],
+            bytes[4],
+            bytes[5],
+            bytes[6],
+            bytes[7],
+        ]);
+        let message_id = u64::from_be_bytes([
+            bytes[8 + 0],
+            bytes[8 + 1],
+            bytes[8 + 2],
+            bytes[8 + 3],
+            bytes[8 + 4],
+            bytes[8 + 5],
+            bytes[8 + 6],
+            bytes[8 + 7],
+        ]);
+        let expected_pkt_index = bytes[2 * 8];
+        drop(bytes.drain(..2 * 8 + 1));
+
+        if bytes.len() as u64 == expected_msg_len {
+            Ok(NettingMessage {
+                message_id,
+                kind: NettingMessageKind::parse(bytes),
+            })
+        } else {
+            Err(NettingMessageParseError::PartialMessage {
+                message_id,
+                expected_len: expected_msg_len,
+                msg: NettingMessageBytesWithOrdering {
+                    packet_index: expected_pkt_index,
+                    bytes,
+                },
+            })
+        }
+    }
 }
 
 trait NettingMessenger {
@@ -129,6 +216,11 @@ pub struct PeerRegistryEntry {
 
 pub struct RecvReconciliationState {
     pub client_id: [u8; 9],
+}
+
+pub struct AttributedInboundBytes {
+    pub decrypted_bytes: Vec<u8>,
+    pub addr: SocketAddr,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -383,7 +475,7 @@ impl PeerConnectionData {
     }
 
     pub fn write_synapse_transmission(&mut self, encrypted: bool, discriminant: u8, bytes: &[u8]) {
-        debug_assert!(bytes.len() < MAX_UDP_DG_SIZE / 2, "synapse transmission sizes should be less than a single udp packet");
+        debug_assert!(bytes.len() < MAX_KNOWN_PACKET_LEN, "synapse transmission sizes should be less than a single udp packet");
 
         let transmission_number = self.alloc_transmission_number();
         trc::trace!("NET-OSYNT Allocating transmission number {transmission_number:?} for {:?}", discriminant >> 5);
@@ -454,7 +546,12 @@ impl PeerRegistryEntry {
     ///
     /// Higher level systems will defrag synapse transmissions into netting
     /// messages that have actual game data.
-    pub async fn mine() -> (Self, Sender<(NettingMessage, SocketAddr)>, Receiver<NettingMessage>, Sender<OutboundSynapseTransmission>) {
+    pub async fn mine() -> (
+        Self,
+        Sender<(NettingMessage, Option<SocketAddr>)>,
+        Receiver<NettingMessage>,
+        Sender<OutboundSynapseTransmission>,
+    ) {
         let client_id = Self::client_id_gen();
         trc::info!("Client ID: {client_id:?}");
 
@@ -469,7 +566,7 @@ impl PeerRegistryEntry {
         // Channels for sending netting messages. These are reconstituted known message synapse
         // transmissions.
         let (inbound_known_tx, mut inbound_known_rx) = mpsc::channel(1024);
-        let (outbound_netting_tx, mut outbound_netting_rx) = mpsc::channel(1024);
+        let (outbound_netting_tx, mut outbound_netting_rx) = mpsc::channel::<(NettingMessage, Option<SocketAddr>)>(1024);
         let (inbound_netting_tx, inbound_netting_rx) = mpsc::channel(1024);
 
         // Channels for sending synapse transmissions. These are lower level protocols.
@@ -613,7 +710,6 @@ impl PeerRegistryEntry {
                                 break 'ack_end;
                             };
                             trc::info!("NET-ISYNT-ACK tx_no={:?}", isynt.transmission_number);
-                            // TODO Reset?
                             connection_data.active_messages[isynt.transmission_number].0 = 0;
                         },
                         SynapseTransmissionKind::KnownPacket => 'known_packet_end: {
@@ -628,7 +724,10 @@ impl PeerRegistryEntry {
                                 // Crypto thinks they're terrible, ignore their message.
                                 break 'known_packet_end;
                             };
-                            inbound_known_tx.send(decrypted_bytes).await.expect("channel to not be closed");
+                            inbound_known_tx.send(AttributedInboundBytes {
+                                decrypted_bytes,
+                                addr: sender_addr,
+                            }).await.expect("channel to not be closed");
 
                             ack_fut.await.expect("no issues sending ack");
                         },
@@ -746,27 +845,63 @@ impl PeerRegistryEntry {
         let converted_osynt_tx = external_osynt_tx.clone();
         let netting_to_known_task_handle = tokio::spawn(async move {
             loop {
-                let (_msg, _addr) = outbound_netting_rx.recv().await.expect("tx channel to not be dropped");
-                // TODO Reconstitute multiple osynts and propagate upwards. Drop for now.
-                converted_osynt_tx.send(unimplemented!("sliced apart data")).await.expect("rx channel to not be dropped");
+                let (msg, addr) = outbound_netting_rx.recv().await.expect("tx channel to not be dropped");
+                // TODO Break apart into multiple osynts and shove through the network. Drop for
+                // now.
+                for bytes in msg.into_known_packet_bytes() {
+                    converted_osynt_tx.send(OutboundSynapseTransmission {
+                        kind: OutboundSynapseTransmissionKind::KnownPacket,
+                        bytes,
+                        maybe_target_address: addr,
+                    }).await.expect("rx channel to not be dropped");
+                }
             }
         });
 
         let known_to_netting_task_handle = tokio::spawn(async move {
+            // TODO Periodically clean up old values.
+            let mut cached_partials: HashMap<_, Vec<NettingMessageBytesWithOrdering>> = HashMap::new();
             loop {
                 let msg = match inbound_known_rx.recv().await {
-                    Some(data) => {
-                        data
-                    },
+                    Some(data) => { data },
                     None => {
                         trc::error!("tx channel to not be dropped");
                         return;
                     },
                 };
-                trc::info!("isynt bytes as string: {:?}", String::from_utf8(msg));
-                // TODO Break apart into multiple osynts and shove through the network. Drop for
-                // now.
-                // inbound_netting_tx.send(unimplemented!("nothing doing")).await.expect("rx channel to not be dropped");
+                let opt_msg = match NettingMessage::parse(msg.decrypted_bytes) {
+                    Ok(msg) => Some(msg),
+                    Err(NettingMessageParseError::PartialMessage {
+                        message_id,
+                        expected_len,
+                        msg: addressed_message_bytes,
+                    }) => {
+                        let cache = cached_partials.entry((msg.addr, message_id, expected_len)).or_default();
+                        if cache.iter().all(|a| a.packet_index != addressed_message_bytes.packet_index) {
+                            cache.push(addressed_message_bytes);
+                        }
+                        let loaded_byte_count = cache.iter()
+                            .map(|a| a.bytes.len() as u64)
+                            .sum::<u64>();
+                        if loaded_byte_count == expected_len {
+                            cache.sort_by_key(|a| a.packet_index);
+                            let cache = cached_partials.remove(&(msg.addr, message_id, expected_len)).expect("value I just had to be here");
+                            let combined_message_bytes = expected_len.to_be_bytes().into_iter()
+                                .chain(message_id.to_be_bytes())
+                                .chain(cache.into_iter().flat_map(|a| a.bytes.into_iter()))
+                                .collect::<Vec<_>>();
+                            Some(NettingMessage::parse(combined_message_bytes)
+                                .expect("message should have fully loaded at this point"))
+                        } else {
+                            None
+                        }
+                    },
+                };
+                let Some(msg) = opt_msg else {
+                    // If we couldn't load a message, we're done for the loop, carry on!
+                    continue;
+                };
+                inbound_netting_tx.send(msg).await.expect("rx channel to not be dropped");
             }
         });
 
@@ -778,9 +913,6 @@ impl PeerRegistryEntry {
             local_addr,
         }, outbound_netting_tx, inbound_netting_rx, external_osynt_tx)
     }
-
-    pub async fn new(passed_peer_addr: SocketAddr) {
-    }
 }
 
 pub struct PeerRegistry {
@@ -791,56 +923,18 @@ pub struct PeerRegistry {
 
 impl PeerRegistry {
     // Returns a receiver for so that the owner of the registry can trigger a new peer connection.
-    pub async fn new(mut local_collation_rx: Receiver<SocketAddr>) -> (Self, Receiver<SocketAddr>, Sender<OutboundSynapseTransmission>, Sender<(NettingMessage, SocketAddr)>) {
-        let (me, outbound_netting_tx, mut inbound_netting_rx, osynt_tx) = PeerRegistryEntry::mine().await;
+    pub async fn new() -> (
+        Self,
+        Receiver<NettingMessage>,
+        Sender<OutboundSynapseTransmission>,
+        Sender<(NettingMessage, Option<SocketAddr>)>,
+    ) {
+        let (me, outbound_netting_tx, inbound_netting_rx, osynt_tx) = PeerRegistryEntry::mine().await;
         trc::info!("Connector port opened {:?}", me.local_addr);
-
-        // Combine new connection queues into same queue.
-        let (collation_tx, collation_rx) = mpsc::channel(512);
-        let network_merger_tx = collation_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                let Some(msg) = inbound_netting_rx.recv().await else {
-                    // TODO re-start this fiber
-                    break;
-                };
-                let NettingMessageKind::NewConnection(addr) = msg.kind else {
-                    continue;
-                };
-                let Ok(()) = network_merger_tx.send(addr).await else {
-                    // TODO re-start this fiber
-                    break;
-                };
-            }
-        });
-        let local_collation_merger_tx = collation_tx;
-        tokio::spawn(async move {
-            loop {
-                let Some(addr) = local_collation_rx.recv().await else {
-                    // TODO re-start this fiber
-                    break;
-                };
-                let Ok(()) = local_collation_merger_tx.send(addr).await else {
-                    // TODO re-start this fiber
-                    break;
-                };
-            }
-        });
 
         (Self {
             me,
             siblings: vec![],
-        }, collation_rx, osynt_tx, outbound_netting_tx)
-    }
-
-    pub async fn accept_connections() {
-    }
-
-    pub async fn tx(&mut self, msg: NettingMessage) {
-    }
-
-    pub async fn rx(&mut self) -> NettingMessage {
-        NettingMessageKind::Noop.to_msg()
-        // ACK message
+        }, inbound_netting_rx, osynt_tx, outbound_netting_tx)
     }
 }

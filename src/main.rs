@@ -1,12 +1,12 @@
 mod netting;
 
-use std::net::IpAddr;
+use std::{collections::VecDeque, net::IpAddr};
 
 use chrono::{Duration, DateTime, Utc};
 
 use crate::netting::{NettingMessageKind, NettingMessage};
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub enum Terrain {
     #[default]
     Grass,
@@ -15,30 +15,35 @@ pub enum Terrain {
     Forest,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct CombatMapCell {
     pub terrain: Terrain,
     pub occupant: Option<usize>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct CombatMap {
     pub cells: Vec<Vec<CombatMapCell>>,
 }
 
+#[derive(Debug)]
 pub enum Action {
 }
 
+#[derive(Debug)]
 pub enum GameStage {
     Combat(CombatMap),
 }
 
+#[derive(Debug)]
 pub enum EnemyKind {
 }
 
+#[derive(Debug)]
 pub enum PlayerKind {
 }
 
+#[derive(Debug)]
 pub enum Character {
     Player {
         name: String,
@@ -52,38 +57,42 @@ pub enum Character {
     },
 }
 
+#[derive(Debug)]
 pub enum RelicKind {
 }
 
+#[derive(Debug)]
 pub struct Relic {
     pub kind: RelicKind,
     pub active: bool,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct RelicCollection {
     pub active_relics: Vec<usize>,
     pub relics: Vec<Relic>,
 }
 
+#[derive(Debug)]
 pub enum Card {
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Deck {
     pub cards: Vec<Card>,
-    pub draw: Vec<usize>,
-    pub hand: Vec<usize>,
-    pub discard: Vec<usize>,
+    pub draw: VecDeque<usize>,
+    pub hand: VecDeque<usize>,
+    pub discard: VecDeque<usize>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct World {
     pub generation: u64,
     pub stage: Option<GameStage>,
     pub characters: Vec<Character>,
 }
 
+#[derive(Debug)]
 pub enum UserAction {
 }
 
@@ -241,34 +250,36 @@ async fn main() {
         .with_target(false)
         .finish();
     trc::subscriber::set_global_default(subscriber).expect("no issues setting up logging");
+    let mut input = String::new();
 
-    let (netting, msg_rx) = netting::Netting::new().await;
+    let (netting, mut netting_msg_rx) = netting::Netting::new().await;
+    tokio::spawn(async move {
+        loop {
+            let Some(msg) = netting_msg_rx.recv().await else {
+                continue;
+            };
+            trc::info!("New message landed {msg:?}");
+        }
+    });
 
     // We're running some tests for connecting, need to input thing.
-    let mut input = String::new();
     println!("Connect to?");
     std::io::stdin().read_line(&mut input).unwrap();
     let addr = input.trim();
     println!("Will attempt to connect to {addr:?}...");
     netting.create_peer_connection(addr.parse().unwrap()).await;
-
-    println!("Connect to?");
     input.truncate(0);
-    std::io::stdin().read_line(&mut input).unwrap();
-    let msg0 = input.trim();
-    netting.broadcast(msg0).await;
 
-    println!("Connect to?");
-    input.truncate(0);
-    std::io::stdin().read_line(&mut input).unwrap();
-    let msg1 = input.trim();
-    netting.broadcast(msg1).await;
-
-    println!("Connect to?");
-    input.truncate(0);
-    std::io::stdin().read_line(&mut input).unwrap();
-    let msg2 = input.trim();
-    netting.broadcast(msg2).await;
+    loop {
+        println!("Enter string to send (q) to quit, no escape sequences");
+        std::io::stdin().read_line(&mut input).unwrap();
+        let msg = input.trim();
+        if msg == "q" {
+            break;
+        }
+        netting.broadcast(msg).await;
+        input.truncate(0);
+    }
 
     loop {
         // TODO Make this a "wait for everything to finish" thing instead of just sleeping.
@@ -307,7 +318,7 @@ async fn main() {
     //                     break 'main_loop;
     //                 },
     //             }
-    //         } 
+    //         }
     //     });
     // });
 }
