@@ -100,21 +100,18 @@ impl Netting {
         }).await.expect("no issues sending");
     }
 
-    pub async fn broadcast(&self, msg: &str) {
+    pub async fn broadcast(&self, msg: NettingMessage) {
         self.netting_tx
-            .send((NettingMessageKind::NakedLogString(msg.to_owned()).to_msg(), None))
+            .send((msg, None))
             .await
             .expect("no issues sending");
     }
 
-    pub async fn send_to(&self, msg: &str, peer: ClientId) {
+    pub async fn send_to(&self, msg: NettingMessage, peer: ClientId) {
         let Some(socket_addr) = self.registry.find_socket_for(peer).await else {
             return;
         };
-        self.netting_tx.send((
-            NettingMessageKind::NakedLogString(msg.to_owned()).to_msg(),
-            Some(socket_addr),
-        )).await.expect("no issues sending");
+        self.netting_tx.send((msg, Some(socket_addr))).await.expect("no issues sending");
     }
 }
 
@@ -689,15 +686,15 @@ impl PeerRegistry {
 
                     let oneshot_ack_tx = ack_tx.clone();
                     let ack_fut = async move { oneshot_ack_tx.send((isynt.transmission_number, sender_addr)).await };
-                    let checksum = {
-                        let mut hasher = sha2::Sha256::new();
-                        hasher.update(dg);
-                        hasher.finalize()
-                    };
 
                     match isynt.kind {
                         // [5 bytes; hello][9 bytes client id][remainder; peer_secret]
                         SynapseTransmissionKind::HandshakeInitiate => 'initiate_end: {
+                            let checksum = {
+                                let mut hasher = sha2::Sha256::new();
+                                hasher.update(dg);
+                                hasher.finalize()
+                            };
                             let connection_data = connections.entry(sender_addr).or_default();
                             if connection_data.recently_received(&isynt, checksum.to_vec()) {
                                 break 'initiate_end;
@@ -753,6 +750,11 @@ impl PeerRegistry {
                         // TODO Make the HandshakeResponse send another packet to confirm.
                         // [8 bytes; mlen][mlen bytes; ciphertext][remainder; peer_secret]
                         SynapseTransmissionKind::HandshakeResponse => 'response_end: {
+                            let checksum = {
+                                let mut hasher = sha2::Sha256::new();
+                                hasher.update(dg);
+                                hasher.finalize()
+                            };
                             if isynt.bytes.len() < 8 {
                                 break 'response_end;
                             }
@@ -842,13 +844,20 @@ impl PeerRegistry {
                                 // We aren't connected, reject their request.
                                 break 'known_packet_end;
                             };
-                            if connection_data.recently_received(&isynt, checksum.to_vec()) {
-                                break 'known_packet_end;
-                            }
                             let Some(decrypted_bytes) = connection_data.decrypt(&isynt.bytes) else {
                                 // Crypto thinks they're terrible, ignore their message.
                                 break 'known_packet_end;
                             };
+                            // This checksum is different since we want to checksum the contents,
+                            // not the packet itself, jic the cipher decides to change it up on us.
+                            let checksum = {
+                                let mut hasher = sha2::Sha256::new();
+                                hasher.update(decrypted_bytes.as_slice());
+                                hasher.finalize()
+                            };
+                            if connection_data.recently_received(&isynt, checksum.to_vec()) {
+                                break 'known_packet_end;
+                            }
                             inbound_known_tx.send(AttributedInboundBytes {
                                 decrypted_bytes,
                                 addr: sender_addr,

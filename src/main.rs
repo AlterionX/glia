@@ -277,7 +277,7 @@ async fn main() {
         if msg == "q" {
             break;
         }
-        netting.broadcast(msg).await;
+        netting.broadcast(NettingMessageKind::NakedLogString(msg.to_owned()).to_msg()).await;
         input.truncate(0);
     }
 
