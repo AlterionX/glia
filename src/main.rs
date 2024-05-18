@@ -335,7 +335,7 @@ async fn main() {
                                 _target_generation,
                             )) = msg {
                                 // This means we're hard resetting and need to reset counters.
-                                trc::info!("resetting catchup target to {target_arrival_time:?}");
+                                trc::info!("SIM-RESET resetting catchup target to {target_arrival_time:?}");
                                 target_sim_time = target_arrival_time + (now - target_arrival_time);
                             } else {
                                 // This means we're still aiming for the same target generation --
