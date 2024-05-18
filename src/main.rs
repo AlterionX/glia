@@ -353,7 +353,7 @@ async fn main() {
 
                 let mut working_world = sim_world_stash.read().await.peek_most_recent().expect("at least one world to be present").clone();
                 working_world.generation += 1;
-                trc::info!("SIM-LOOP generation={:?}", working_world.generation);
+                trc::trace!("SIM-LOOP generation={:?}", working_world.generation);
                 // As the last step of each step, stash the world and move on.
                 // TODO force fixed wake up
                 sim_world_stash.write().await.historical_worlds.push_back(working_world);
