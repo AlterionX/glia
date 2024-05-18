@@ -1,13 +1,15 @@
 mod netting;
 
-use std::{collections::VecDeque, net::IpAddr, sync::{atomic::AtomicBool, Arc}};
+use std::{cell::RefCell, collections::VecDeque, net::IpAddr, sync::{atomic::AtomicBool, Arc}};
 
 use chrono::{Duration, DateTime, Utc};
 use bincode::{Encode, Decode};
 
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc::{self, error::TryRecvError}, RwLock};
 
 use crate::netting::{NettingMessageKind, NettingMessage};
+
+const TARGET_FPS: u16 = 120;
 
 #[derive(Debug, Default, Clone, Encode, Decode)]
 pub enum Terrain {
@@ -294,6 +296,80 @@ impl WorldStash {
     }
 }
 
+#[derive(Debug, Copy, Clone)]
+pub struct FrameWindowingRanges {
+}
+
+impl FrameWindowingRanges {
+    fn new(center: u64) -> Self {
+        Self {
+        }
+    }
+
+    fn signed_distance(&self, input: u64) -> i64 {
+        0
+    }
+    fn is_wraparound(&self, input: u64) -> bool {
+        false
+    }
+}
+
+pub struct FrameSync {
+    pub center: u64,
+    range_cache: RefCell<Option<FrameWindowingRanges>>,
+}
+
+impl FrameSync {
+    const FRAME_MILLISECONDS: u16 = 1000 / TARGET_FPS;
+    /// We'll tolerate ~ 2 seconds of being ahead -- that's (currently) around how long it
+    /// takes to make two round trips around the globe.
+    const LOOKAHEAD_TOLERANCE: u16 = 2000 / Self::FRAME_MILLISECONDS;
+    /// This is the bottom window of frames we're expecting from across the network. We won't have
+    /// an upper limit, since the upper limit doesn't really exist.
+    const VALIDITY_WINDOW_LOWER_DISTANCE: i64 = Self::LOOKAHEAD_TOLERANCE as i64 * 2;
+    const VALIDITY_WINDOW_UPPER_DISTANCE: i64 = 9999;
+
+    pub fn new(center: u64) -> Self {
+        Self {
+            center,
+            range_cache: RefCell::new(None),
+        }
+    }
+
+    fn get_ranges(&self) -> FrameWindowingRanges {
+        let mut cache = self.range_cache.borrow_mut();
+        let data = if let Some(ref r) = *cache { *r } else {
+            let r = FrameWindowingRanges::new(self.center);
+            *cache = Some(r);
+            r
+        };
+        data
+    }
+
+    /// Returns Some((is_wraparound, signed_distance)).
+    /// Returns None if this value should be ignored.
+    pub fn signed_distance(&self, input: u64) -> Option<(bool, i64)> {
+        let r = self.get_ranges();
+        let distance = r.signed_distance(input);
+        if distance < -Self::VALIDITY_WINDOW_LOWER_DISTANCE || distance > Self::VALIDITY_WINDOW_UPPER_DISTANCE {
+            return None;
+        }
+        Some((r.is_wraparound(input), distance))
+    }
+
+    pub fn required_delay(&self, input: u64) -> Option<chrono::TimeDelta> {
+        let r = self.get_ranges();
+        let distance = r.signed_distance(input);
+        if distance > -(Self::LOOKAHEAD_TOLERANCE as i64) {
+            return None;
+        }
+
+        // We don't want to wait too long in case the network catchs up to us -- hence the min(20).
+        let frames_to_wait = (distance + (Self::LOOKAHEAD_TOLERANCE as i64)).min(20);
+        Some(chrono::TimeDelta::milliseconds(Self::FRAME_MILLISECONDS as i64 * frames_to_wait as i64))
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let subscriber = tracing_subscriber::fmt()
@@ -315,6 +391,7 @@ async fn main() {
     let sim_world_stash = Arc::clone(&world_stash);
     let (sim_run_state_tx, mut sim_run_state_rx) = mpsc::channel::<bool>(10);
     let (sim_force_jump_tx, mut sim_force_jump_rx) = mpsc::channel::<Option<(chrono::DateTime<chrono::Utc>, u64)>>(10);
+    let (sim_framesync_tx, mut sim_framesync_rx) = mpsc::channel::<u64>(10);
     let sim_running = Arc::new(AtomicBool::new(false));
     let sim_running_internal = Arc::clone(&sim_running);
     let _sim_handle = tokio::spawn(async move {
@@ -325,6 +402,7 @@ async fn main() {
 
             // The world loops repeatedly.
             let mut target_sim_time = Utc::now();
+            let mut expected_global_frame = 0;
             loop {
                 let now = Utc::now();
                 if now < target_sim_time {
@@ -352,11 +430,56 @@ async fn main() {
                 }
 
                 let mut working_world = sim_world_stash.read().await.peek_most_recent().expect("at least one world to be present").clone();
+                let working_world_generation = working_world.generation;
                 working_world.generation += 1;
                 trc::trace!("SIM-LOOP generation={:?}", working_world.generation);
                 // As the last step of each step, stash the world and move on.
                 // TODO force fixed wake up
                 sim_world_stash.write().await.historical_worlds.push_back(working_world);
+
+                let mut framesyncing = true;
+                let mut framesyncing_frame = None;
+                let framesync_limits = None;
+                let framesyncing_data = FrameSync::new(working_world_generation);
+                while framesyncing {
+                    match sim_framesync_rx.try_recv() {
+                        Ok(frame) => {
+                            // TODO
+                            // Also, tolerance... it should take ages to wrap around so just assume
+                            // it's alright.
+                            let should_ignore = if frame < working_world_generation {
+                            } else {
+                                d
+                            } > TOLERANCE;
+                            if is_wraparound || framesyncing_frame.map(|tracking_min| tracking_min >= frame).unwrap_or(true) {
+                                framesyncing_frame = Some(frame);
+                            }
+                        },
+                        Err(TryRecvError::Empty) => {
+                            // Do nothing, we'll proceed to the next loop since there's no need to
+                            // wait or we've already set the relevant values.
+                            framesyncing = false;
+                        },
+                        Err(TryRecvError::Disconnected) => {
+                            panic!("should still be connected");
+                        },
+                    }
+                }
+
+                // TODO Handle single player mode by ignoring 
+                if let Some(framesyncing_frame) = framesyncing_frame {
+                    let offset = framesyncing_frame - working_world_generation;
+                    if framesyncing_frame < working_world_generation - SIM_LOOKAHEAD_TOLERANCE.min(working_world_generation) {
+                        // We'll add an extra delay to the next frame while we wait. This
+                        // is a bit of a hack, but should be okay.
+                        let frames_ahead = framesyncing_frame - working_world_generation;
+                        // We'll only delay for part of the frame in case the network comes through and
+                        // we manage to catch up.
+                        let frame_delay = frames_ahead.min(20).try_into().expect("min should trim off overflow");
+                        target_sim_time += chrono::TimeDelta::milliseconds(1000 / 20) * frame_delay;
+                    }
+                }
+
                 target_sim_time += chrono::TimeDelta::milliseconds(1000 / 20);
             }
         }
@@ -367,6 +490,7 @@ async fn main() {
     let sim_running_netting = Arc::clone(&sim_running);
     let netting_sim_force_jump_tx = sim_force_jump_tx.clone();
     let netting_sim_run_state_tx = sim_run_state_tx.clone();
+    let netting_sim_framesync_tx = sim_framesync_tx.clone();
     tokio::spawn(async move {
         loop {
             let Some(msg) = netting_msg_rx.recv().await else {
@@ -414,6 +538,9 @@ async fn main() {
                 },
                 NettingMessageKind::User(ua) => {
                     unimplemented!("not yet able to handle user actions");
+                },
+                NettingMessageKind::FrameSync(frame) => {
+                    netting_sim_framesync_tx.send(frame).await.expect("connection to work");
                 },
             }
             drop(entered);

@@ -129,6 +129,7 @@ pub enum NettingMessageKind {
     WorldSyncStart,
     WorldSyncEnd,
     User(UserAction),
+    FrameSync(u64),
 }
 
 impl NettingMessageKind {
@@ -166,11 +167,14 @@ impl NettingMessageKind {
             },
             Self::WorldSyncStart => vec![7],
             Self::WorldSyncEnd => vec![8],
+            Self::FrameSync(frame) => {
+                frame.to_be_bytes().into_iter().chain(std::iter::once(9u8)).collect()
+            },
         }
     }
 
     // TODO make this return Result instead of unwrapping
-    pub fn parse(mut bytes: Vec<u8>) -> Result<Self, NettingMessageParseError> {
+    pub fn parse(mut bytes: Vec<u8>) -> Result<Self, NettingMessageKindParseError> {
         let last_byte = bytes.pop();
         match last_byte.expect("bytes should not be empty") {
             0 => Ok(Self::Noop),
@@ -183,7 +187,7 @@ impl NettingMessageKind {
                         bincode::decode_from_slice(
                             bytes.as_slice(),
                             bincode::config::standard()
-                        ).map_err(|_| NettingMessageParseError::BadWorld(bytes))?.0
+                        ).map_err(|_| NettingMessageKindParseError::BadWorld(bytes))?.0
                     )
                 ))
             },
@@ -198,6 +202,26 @@ impl NettingMessageKind {
             8 => {
                 Ok(Self::WorldSyncEnd)
             },
+            9 => {
+                if bytes.len() != 8 {
+                    bytes.push(9);
+                    return Err(NettingMessageKindParseError::PartialMessage {
+                        expected_len: 9,
+                        bytes,
+                    });
+                }
+                let frame_number = u64::from_be_bytes([
+                    bytes[0],
+                    bytes[1],
+                    bytes[2],
+                    bytes[3],
+                    bytes[4],
+                    bytes[5],
+                    bytes[6],
+                    bytes[7],
+                ]);
+                Ok(Self::FrameSync(frame_number))
+            },
             e => unimplemented!("unknown netting message kind discriminant {e:?}"),
         }
     }
@@ -207,6 +231,15 @@ impl NettingMessageKind {
 pub struct NettingMessageBytesWithOrdering {
     pub packet_index: u8,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum NettingMessageKindParseError {
+    PartialMessage {
+        expected_len: u64,
+        bytes: Vec<u8>,
+    },
+    BadWorld(Vec<u8>),
 }
 
 #[derive(Debug)]
@@ -268,9 +301,25 @@ impl NettingMessage {
 
         if bytes.len() as u64 == expected_msg_len {
             trc::info!("NET-IKNOWN-PARSE parsing kind {:?}", bytes);
+            let kind = match NettingMessageKind::parse(bytes) {
+                Ok(k) => k,
+                Err(NettingMessageKindParseError::BadWorld(w)) => {
+                    return Err(NettingMessageParseError::BadWorld(w));
+                },
+                Err(NettingMessageKindParseError::PartialMessage { expected_len, bytes }) => {
+                    return Err(NettingMessageParseError::PartialMessage {
+                        message_id,
+                        expected_len,
+                        msg: NettingMessageBytesWithOrdering {
+                            packet_index: expected_pkt_index,
+                            bytes,
+                        },
+                    });
+                },
+            };
             Ok(NettingMessage {
                 message_id,
-                kind: NettingMessageKind::parse(bytes)?,
+                kind,
             })
         } else {
             Err(NettingMessageParseError::PartialMessage {
