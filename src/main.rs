@@ -1,12 +1,15 @@
 mod netting;
 
-use std::{collections::VecDeque, net::IpAddr};
+use std::{collections::VecDeque, net::IpAddr, sync::{atomic::AtomicBool, Arc}};
 
 use chrono::{Duration, DateTime, Utc};
+use bincode::{Encode, Decode};
+
+use tokio::sync::{mpsc, RwLock};
 
 use crate::netting::{NettingMessageKind, NettingMessage};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Encode, Decode)]
 pub enum Terrain {
     #[default]
     Grass,
@@ -15,35 +18,35 @@ pub enum Terrain {
     Forest,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Encode, Decode)]
 pub struct CombatMapCell {
     pub terrain: Terrain,
     pub occupant: Option<usize>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Encode, Decode)]
 pub struct CombatMap {
     pub cells: Vec<Vec<CombatMapCell>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub enum Action {
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub enum GameStage {
     Combat(CombatMap),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub enum EnemyKind {
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub enum PlayerKind {
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub enum Character {
     Player {
         name: String,
@@ -57,27 +60,27 @@ pub enum Character {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub enum RelicKind {
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct Relic {
     pub kind: RelicKind,
     pub active: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Encode, Decode)]
 pub struct RelicCollection {
     pub active_relics: Vec<usize>,
     pub relics: Vec<Relic>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub enum Card {
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Encode, Decode)]
 pub struct Deck {
     pub cards: Vec<Card>,
     pub draw: VecDeque<usize>,
@@ -85,7 +88,7 @@ pub struct Deck {
     pub discard: VecDeque<usize>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Encode, Decode)]
 pub struct World {
     pub generation: u64,
     pub stage: Option<GameStage>,
@@ -240,6 +243,57 @@ impl Renderer {
     }
 }
 
+// TODO use a triple buffer with some network-related niceties
+#[derive(Default)]
+pub struct WorldStash {
+    stable_state: (),
+    historical_actions: VecDeque<UserAction>,
+    historical_worlds: VecDeque<World>,
+}
+
+impl WorldStash {
+    // Keep 1 second of world data.
+    const MAX_HISTORY: usize = 100;
+
+    fn advance(&mut self, world: World) {
+        // 3's kind of arbitrary marker for "much more than one so that a while loop is too
+        // slow"
+        if self.historical_worlds.len() >= Self::MAX_HISTORY + 3 {
+            // Directly turncate -- it's usually just one but sometimes there's more.
+            drop(self.historical_worlds.drain(..self.historical_worlds.len() - Self::MAX_HISTORY))
+        }
+        while self.historical_worlds.len() >= Self::MAX_HISTORY {
+            self.historical_worlds.pop_front();
+        }
+        // TODO Drop old user actions that occurred prior to end of world.
+
+        // finally stash the new world.
+        self.historical_worlds.push_back(world);
+    }
+
+    fn new(world: World) -> Self {
+        Self {
+            stable_state: (),
+            historical_worlds: [world].into(),
+            historical_actions: VecDeque::with_capacity(Self::MAX_HISTORY),
+        }
+    }
+
+    fn force_reset(&mut self, world: World) {
+        self.historical_worlds.clear();
+        self.historical_actions.clear();
+        self.historical_worlds.push_back(world);
+    }
+
+    fn insert_recent_action(&mut self) {
+        unimplemented!("booo");
+    }
+
+    fn peek_most_recent(&self) -> Option<&World> {
+        self.historical_worlds.back()
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let subscriber = tracing_subscriber::fmt()
@@ -252,46 +306,142 @@ async fn main() {
     trc::subscriber::set_global_default(subscriber).expect("no issues setting up logging");
     let mut input = String::new();
 
+    // Systems setup
+    let world_stash = Arc::new(RwLock::new(WorldStash::new(World::default())));
     let (netting, mut netting_msg_rx) = netting::Netting::new().await;
+    // let (input_tx, input_rx) = mpsc::channel::<Input>();
+    // let game_complete = AtomicBool::new(false);
+
+    let sim_world_stash = Arc::clone(&world_stash);
+    let (sim_run_state_tx, mut sim_run_state_rx) = mpsc::channel::<bool>(10);
+    let (sim_force_jump_tx, mut sim_force_jump_rx) = mpsc::channel::<Option<(chrono::DateTime<chrono::Utc>, u64)>>(10);
+    let sim_running = Arc::new(AtomicBool::new(false));
+    let sim_running_internal = Arc::clone(&sim_running);
+    let _sim_handle = tokio::spawn(async move {
+        loop {
+            sim_running_internal.store(false, std::sync::atomic::Ordering::Relaxed);
+            while !sim_run_state_rx.recv().await.expect("run state rx to not be broken") { }
+            sim_running_internal.store(true, std::sync::atomic::Ordering::Relaxed);
+
+            // The world loops repeatedly.
+            let mut target_sim_time = Utc::now();
+            loop {
+                let now = Utc::now();
+                if now < target_sim_time {
+                    tokio::select! {
+                        Some(msg) = sim_force_jump_rx.recv() => {
+                            if let Some((
+                                target_arrival_time,
+                                _target_generation,
+                            )) = msg {
+                                // This means we're hard resetting and need to reset counters.
+                                trc::info!("resetting catchup target to {target_arrival_time:?}");
+                                target_sim_time = target_arrival_time + (now - target_arrival_time);
+                            } else {
+                                // This means we're still aiming for the same target generation --
+                                // no changes other than cancelling the sleep is needed.
+                            }
+                        },
+                        _ = tokio::time::sleep((target_sim_time - now).to_std().unwrap()) => {},
+                    }
+                }
+                // It's okay to drop errors. If it's disconnected, something's probably
+                // catastrophically wrong anyways.
+                if sim_run_state_rx.try_recv() == Ok(false) {
+                    break;
+                }
+
+                let mut working_world = sim_world_stash.read().await.peek_most_recent().expect("at least one world to be present").clone();
+                working_world.generation += 1;
+                trc::info!("SIM-LOOP generation={:?}", working_world.generation);
+                // As the last step of each step, stash the world and move on.
+                // TODO force fixed wake up
+                sim_world_stash.write().await.historical_worlds.push_back(working_world);
+                target_sim_time += chrono::TimeDelta::milliseconds(1000 / 20);
+            }
+        }
+    });
+
+    let netting_world_stash = Arc::clone(&world_stash);
+    let netting_netting = Arc::clone(&netting);
+    let sim_running_netting = Arc::clone(&sim_running);
+    let netting_sim_force_jump_tx = sim_force_jump_tx.clone();
+    let netting_sim_run_state_tx = sim_run_state_tx.clone();
     tokio::spawn(async move {
         loop {
             let Some(msg) = netting_msg_rx.recv().await else {
                 continue;
             };
-            trc::info!("New message landed {msg:?}");
+            let span = trc::span!(trc::Level::TRACE, "NM-MSG", id = msg.message_id);
+            let entered = span.enter();
+            match msg.kind {
+                NettingMessageKind::Noop => {
+                    trc::info!("NM-NOOP [{:?}] nothin' doin'", msg.message_id);
+                },
+                NettingMessageKind::NakedLogString(log) => {
+                    trc::info!("NM-LOG [{:?}] {log:?}", msg.message_id);
+                },
+                NettingMessageKind::Handshake => {
+                    trc::info!("NM-GREET [{:?}] {:?}", msg.message_id, msg.message_id);
+                },
+                NettingMessageKind::NewConnection(client_id) => {
+                    trc::info!("NM-CONN [{:?}] {:?}", msg.message_id, client_id);
+                    // TODO Avoid this and reconcile multiple WorldTransfers correctly, especially
+                    // on startup.
+                    if sim_running_netting.load(std::sync::atomic::Ordering::Acquire) {
+                        // Only send if running -- this prevents needing reconciliation of game
+                        // state when receiving a WorldTransfer ... for now.
+                        let boxed_world = Box::new(netting_world_stash.read().await.peek_most_recent().expect("at least one world").clone());
+                        netting_netting.send_to(NettingMessageKind::WorldTransfer(boxed_world).to_msg(), client_id).await;
+                    }
+                },
+                NettingMessageKind::DroppedConnection { client_id, } => {
+                    trc::info!("NM-DROP [{:?}] {:?}", msg.message_id, client_id);
+                },
+                NettingMessageKind::WorldSyncStart => {
+                    trc::info!("NM-WSYNC [{:?}] start", msg.message_id);
+                },
+                NettingMessageKind::WorldSyncEnd => {
+                    trc::info!("NM-WSYNC [{:?}] end", msg.message_id);
+                },
+                NettingMessageKind::WorldTransfer(w) => {
+                    trc::info!("NM-WTX [{:?}] transfering world {:?} ...", msg.message_id, w);
+                    let gen = w.generation;
+                    netting_world_stash.write().await.force_reset(*w);
+                    netting_sim_force_jump_tx.send(Some((Utc::now(), gen))).await.expect("everything to be linked");
+                    // Kickstart! This will get ignored if we're already running, so it's all good.
+                    netting_sim_run_state_tx.send(true).await.expect("everything to be linked");
+                },
+                NettingMessageKind::User(ua) => {
+                    unimplemented!("not yet able to handle user actions");
+                },
+            }
+            drop(entered);
         }
     });
 
     // We're running some tests for connecting, need to input thing.
-    println!("Connect to?");
+    println!("Connect to? (Do not connect on both clients. Hit enter once connected to proceed to message sending.)");
     std::io::stdin().read_line(&mut input).unwrap();
     let addr = input.trim();
     println!("Will attempt to connect to {addr:?}...");
-    netting.create_peer_connection(addr.parse().unwrap()).await;
+    if !sim_running.load(std::sync::atomic::Ordering::Acquire) {
+        // Also initiate game state
+        // TODO resolve race condition of multiple connections
+        sim_run_state_tx.send(true).await.expect("no problems kicking off game loop");
+        netting.create_peer_connection(addr.parse().unwrap()).await;
+        trc::info!("Skipping peer -- already connected to mesh");
+    }
     input.truncate(0);
 
     loop {
-        println!("Enter string to send (q) to quit, no escape sequences");
+        println!("Enter string to send");
         std::io::stdin().read_line(&mut input).unwrap();
         let msg = input.trim();
-        if msg == "q" {
-            break;
-        }
         netting.broadcast(NettingMessageKind::NakedLogString(msg.to_owned()).to_msg()).await;
         input.truncate(0);
     }
 
-    loop {
-        // TODO Make this a "wait for everything to finish" thing instead of just sleeping.
-        tokio::time::sleep(Duration::milliseconds(50000).to_std().unwrap()).await;
-    }
-    // // Systems setup
-    // let mut world = World::default();
-    // let (input_tx, input_rx) = mpsc::channel::<Input>();
-    // let game_complete = AtomicBool::new(false);
-    // let network_and_inputs = Netting::new();
-
-    // // Begin running game systems...
     // thread::scope(|s| {
     //     let actions_since_sync: Vec<UserAction> = vec![];
     //     let worlds_since_sync: Vec<(DateTime<Utc>, World)> = vec![];

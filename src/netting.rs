@@ -1,4 +1,4 @@
-use std::{alloc::Layout, collections::HashMap, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{alloc::Layout, collections::HashMap, io::Cursor, net::SocketAddr, pin::Pin, sync::Arc};
 
 use chacha::{aead::Aead, AeadCore, KeyInit};
 use chrono::{TimeDelta, Utc};
@@ -80,15 +80,15 @@ pub struct Netting {
 
 impl Netting {
     // TODO This should probably be yet another event.
-    pub async fn new() -> (Self, Receiver<NettingMessage>) {
+    pub async fn new() -> (Arc<Self>, Receiver<NettingMessage>) {
         // TODO Actually use these
         let (registry, netting_rx, force_osynt_tx, netting_tx) = PeerRegistry::new().await;
 
-        (Self {
+        (Arc::new(Self {
             registry,
             force_osynt_tx,
             netting_tx,
-        }, netting_rx)
+        }), netting_rx)
     }
 
     // TODO Make this return the client id of the peer.
@@ -120,11 +120,14 @@ pub enum NettingMessageKind {
     Noop,
     NakedLogString(String),
     Handshake,
-    NewConnection(SocketAddr),
+    NewConnection(ClientId),
     DroppedConnection {
         client_id: ClientId,
     },
+    /// Boxed world to prevent enum size blowup.
     WorldTransfer(Box<World>),
+    WorldSyncStart,
+    WorldSyncEnd,
     User(UserAction),
 }
 
@@ -138,34 +141,62 @@ impl NettingMessageKind {
         }
     }
 
+    // DISCRIMINANT IS THE LAST BYTE!
     pub fn into_bytes(self) -> Vec<u8> {
         match self {
             Self::Noop => vec![0],
             Self::Handshake => vec![1],
             Self::NewConnection(_addr) => vec![2],
             Self::DroppedConnection { client_id: _ } => vec![3],
-            Self::WorldTransfer(_w) => vec![4],
+            Self::WorldTransfer(w) => {
+                trc::info!("NET-NM-ENCODE-WTX world: {:?}", w);
+                let mut bytes = bincode::encode_to_vec(
+                    w,
+                    bincode::config::standard()
+                ).expect("no issues encoding");
+                trc::info!("NET-NM-ENCODE-WTX bytes: {:?}", bytes);
+                bytes.push(4); // discriminant
+                bytes
+            },
             Self::User(_u) => vec![5],
             Self::NakedLogString(log_str) => {
                 let mut v = log_str.into_bytes();
                 v.push(6);
                 v
             },
+            Self::WorldSyncStart => vec![7],
+            Self::WorldSyncEnd => vec![8],
         }
     }
 
     // TODO make this return Result instead of unwrapping
-    pub fn parse(mut bytes: Vec<u8>) -> Self {
-        match bytes.last().expect("bytes should not be empty") {
-            0 => Self::Noop,
-            1 => Self::Handshake,
-            2 => Self::NewConnection(unimplemented!("wat")),
-            3 => Self::DroppedConnection { client_id: ClientId(bytes.try_into().unwrap()) },
-            4 => Self::WorldTransfer(unimplemented!("wat")),
-            5 => Self::User(unimplemented!("wat")),
+    pub fn parse(mut bytes: Vec<u8>) -> Result<Self, NettingMessageParseError> {
+        let last_byte = bytes.pop();
+        match last_byte.expect("bytes should not be empty") {
+            0 => Ok(Self::Noop),
+            1 => Ok(Self::Handshake),
+            2 => Ok(Self::NewConnection(unimplemented!("this isn't really meant to be sent"))),
+            3 => Ok(Self::DroppedConnection { client_id: ClientId(bytes.try_into().unwrap()) }),
+            4 => {
+                Ok(Self::WorldTransfer(
+                    Box::new(
+                        bincode::decode_from_slice(
+                            bytes.as_slice(),
+                            bincode::config::standard()
+                        ).map_err(|_| NettingMessageParseError::BadWorld(bytes))?.0
+                    )
+                ))
+            },
+            5 => Ok(Self::User(unimplemented!("wat"))),
             6 => {
                 bytes.pop();
-                Self::NakedLogString(String::from_utf8(bytes).expect("only string passed"))
+                Ok(Self::NakedLogString(String::from_utf8(bytes).expect("only string passed")))
+            },
+            7 => {
+                Ok(Self::WorldSyncStart)
+            },
+            8 => {
+                Ok(Self::WorldSyncEnd)
             },
             e => unimplemented!("unknown netting message kind discriminant {e:?}"),
         }
@@ -185,6 +216,7 @@ pub enum NettingMessageParseError {
         expected_len: u64,
         msg: NettingMessageBytesWithOrdering
     },
+    BadWorld(Vec<u8>),
 }
 
 #[derive(Debug)]
@@ -196,7 +228,9 @@ pub struct NettingMessage {
 impl NettingMessage {
     pub fn into_known_packet_bytes(self) -> Vec<Vec<u8>> {
         let unfettered_bytes = self.kind.into_bytes();
-        let common_header: Vec<_> = (unfettered_bytes.len() as u64).to_be_bytes().into_iter().chain(self.message_id.to_be_bytes().into_iter()).collect();
+        let common_header: Vec<_> = (unfettered_bytes.len() as u64).to_be_bytes().into_iter()
+            .chain(self.message_id.to_be_bytes())
+            .collect();
         // We expect max of u8::MAX packets. Give up otherwise
         assert!(unfettered_bytes.len() / (u8::MAX as usize) < MAX_KNOWN_PACKET_LEN, "netting message too big for protocol");
         let chunk_size = MAX_KNOWN_PACKET_LEN - common_header.len() - 1;
@@ -233,9 +267,10 @@ impl NettingMessage {
         drop(bytes.drain(..2 * 8 + 1));
 
         if bytes.len() as u64 == expected_msg_len {
+            trc::info!("NET-IKNOWN-PARSE parsing kind {:?}", bytes);
             Ok(NettingMessage {
                 message_id,
-                kind: NettingMessageKind::parse(bytes),
+                kind: NettingMessageKind::parse(bytes)?,
             })
         } else {
             Err(NettingMessageParseError::PartialMessage {
@@ -637,6 +672,7 @@ impl PeerRegistry {
         let (connection_notification_tx, mut connection_notification_rx) = mpsc::channel(10);
 
         let own_client_id = me.client_id;
+        let inbound_raw_netting_tx = inbound_netting_tx.clone();
         let udp_synt_interop_task_handle = tokio::spawn(async move {
             poll.registry().register(&mut socket, Self::OWN_PORT, Interest::READABLE | Interest::WRITABLE).unwrap();
             let mut dg_buf_mem = [0u8; MAX_UDP_DG_SIZE];
@@ -1010,6 +1046,7 @@ impl PeerRegistry {
                         return;
                     },
                 };
+                trc::info!("NET-IKNOWN-PARSE {:?}", msg.decrypted_bytes);
                 let opt_msg = match NettingMessage::parse(msg.decrypted_bytes) {
                     Ok(msg) => Some(msg),
                     Err(NettingMessageParseError::PartialMessage {
@@ -1037,16 +1074,22 @@ impl PeerRegistry {
                             None
                         }
                     },
+                    Err(NettingMessageParseError::BadWorld(world)) => {
+                        // TODO Hexencode
+                        trc::error!("corrupted world sent across the wire {:?}", base64::encode(world));
+                        None
+                    },
                 };
                 let Some(msg) = opt_msg else {
                     // If we couldn't load a message, we're done for the loop, carry on!
                     continue;
                 };
-                inbound_netting_tx.send(msg).await.expect("rx channel to not be dropped");
+                inbound_raw_netting_tx.send(msg).await.expect("rx channel to not be dropped");
             }
         });
 
         let siblings_ref = Arc::clone(&siblings);
+        let inbound_sibling_netting_tx = inbound_netting_tx.clone();
         let peer_connected_task_handle = tokio::spawn(async move {
             loop {
                 let Some((peer_id, addr)) = connection_notification_rx.recv().await else {
@@ -1056,6 +1099,7 @@ impl PeerRegistry {
                     client_id: peer_id,
                     local_addr: addr,
                 });
+                inbound_sibling_netting_tx.send(NettingMessageKind::NewConnection(peer_id).to_msg()).await.expect("it's okay");
             }
         });
 
