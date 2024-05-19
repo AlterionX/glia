@@ -10,7 +10,7 @@ use tokio::sync::{mpsc::{self, error::TryRecvError}, RwLock};
 
 use crate::{netting::{NettingMessageKind, Netting}, framesync::FrameSync};
 
-const TARGET_FPS: u16 = 60;
+const TARGET_FPS: u16 = 120;
 
 #[derive(Debug, Default, Clone, Encode, Decode)]
 pub enum Terrain {

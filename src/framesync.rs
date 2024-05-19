@@ -48,13 +48,11 @@ impl FrameSync {
     const PEER_LAG_TOLERANCE: u16 = 2000 / Self::FRAME_MILLISECONDS;
     /// This is the bottom window of frames we're expecting from across the network. We won't have
     /// an upper limit, since the upper limit doesn't really exist.
-    const VALIDITY_WINDOW_LOWER_DISTANCE: i64 =
-        i64::MAX / 2;
-        // Self::PEER_LAG_TOLERANCE as i64 * 2;
+    const VALIDITY_WINDOW_LOWER_DISTANCE: i64 = Self::PEER_LAG_TOLERANCE as i64 * 2;
     const VALIDITY_WINDOW_UPPER_DISTANCE: i64 = 9999;
     /// We'll allow old data up to two times the lookahead tolerance. This should let us get away
     /// with using u16s as the frame integer type, but I'm lazy.
-    const DATA_AGE_LIMIT: chrono::TimeDelta = chrono::TimeDelta::milliseconds(Self::PEER_LAG_TOLERANCE as i64 * 1000000);
+    const DATA_AGE_LIMIT: chrono::TimeDelta = chrono::TimeDelta::milliseconds(Self::PEER_LAG_TOLERANCE as i64 * 5);
 
     pub fn new() -> Self {
         Self {
