@@ -48,11 +48,13 @@ impl FrameSync {
     const PEER_LAG_TOLERANCE: u16 = 2000 / Self::FRAME_MILLISECONDS;
     /// This is the bottom window of frames we're expecting from across the network. We won't have
     /// an upper limit, since the upper limit doesn't really exist.
-    const VALIDITY_WINDOW_LOWER_DISTANCE: i64 = Self::PEER_LAG_TOLERANCE as i64 * 2;
+    const VALIDITY_WINDOW_LOWER_DISTANCE: i64 =
+        i64::MAX / 2;
+        // Self::PEER_LAG_TOLERANCE as i64 * 2;
     const VALIDITY_WINDOW_UPPER_DISTANCE: i64 = 9999;
     /// We'll allow old data up to two times the lookahead tolerance. This should let us get away
     /// with using u16s as the frame integer type, but I'm lazy.
-    const DATA_AGE_LIMIT: chrono::TimeDelta = chrono::TimeDelta::milliseconds(Self::PEER_LAG_TOLERANCE as i64 * 2);
+    const DATA_AGE_LIMIT: chrono::TimeDelta = chrono::TimeDelta::milliseconds(Self::PEER_LAG_TOLERANCE as i64 * 1000000);
 
     pub fn new() -> Self {
         Self {
@@ -76,7 +78,11 @@ impl FrameSync {
     }
 
     pub fn record_framesync(&mut self, peer: ClientId, frame: u64) {
-        self.historical_framesyncs.insert(peer, (Utc::now(), frame));
+        let entry = self.historical_framesyncs.entry(peer).or_insert_with(|| (Utc::now(), frame));
+        // Only update if frame advances the value.
+        if entry.1 < frame {
+            *entry = (Utc::now(), frame);
+        }
     }
 
     pub async fn calculate_delay(&self, position: u64) -> Option<chrono::TimeDelta> {
@@ -105,7 +111,7 @@ impl FrameSync {
                 limiter = Some(prev);
             }
         }
-        trc::debug!("FRAMESYNC-LIMITER-RECORD limiter={limiter:?}");
+        trc::info!("FRAMESYNC-LIMITER-RECORD center={position:?} limiter={limiter:?}");
         // If we don't have an earliest frame, assume we're alone and proceed as if we can
         // continue.
         let (_, limiting_frame, _) = limiter?;
@@ -118,6 +124,7 @@ impl FrameSync {
     async fn signed_distance(&self, position: u64, input: u64) -> Option<(bool, i64)> {
         let r = self.get_ranges(position).await;
         let distance = r.signed_distance(input);
+        trc::info!("FRAMESYNC-SIGNED-DISTANCE position={position:?} input={input:?}");
         if distance < -Self::VALIDITY_WINDOW_LOWER_DISTANCE || distance > Self::VALIDITY_WINDOW_UPPER_DISTANCE {
             return None;
         }

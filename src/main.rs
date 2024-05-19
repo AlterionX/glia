@@ -1,7 +1,7 @@
 mod netting;
 mod framesync;
 
-use std::{cell::RefCell, collections::{HashMap, VecDeque}, net::IpAddr, ops::{Bound, Range, RangeInclusive}, sync::{atomic::AtomicBool, Arc}};
+use std::{cell::RefCell, collections::{hash_map, HashMap, VecDeque}, net::IpAddr, ops::{Bound, Range, RangeInclusive}, sync::{atomic::AtomicBool, Arc}};
 
 use chrono::{Duration, DateTime, Utc};
 use bincode::{Encode, Decode};
@@ -10,7 +10,7 @@ use tokio::sync::{mpsc::{self, error::TryRecvError}, RwLock};
 
 use crate::{netting::{NettingMessageKind, Netting}, framesync::FrameSync};
 
-const TARGET_FPS: u16 = 120;
+const TARGET_FPS: u16 = 60;
 
 #[derive(Debug, Default, Clone, Encode, Decode)]
 pub enum Terrain {
@@ -383,6 +383,9 @@ async fn main() {
     let netting_sim_run_state_tx = sim_run_state_tx.clone();
     let netting_framesync = Arc::clone(&framesync);
     tokio::spawn(async move {
+        // Local record to avoid lock contention.
+        let mut framesync_records = HashMap::new();
+
         loop {
             let Some(inbound_msg) = netting_msg_rx.recv().await else {
                 continue;
@@ -432,7 +435,27 @@ async fn main() {
                     unimplemented!("not yet able to handle user actions");
                 },
                 NettingMessageKind::FrameSync(frame) => {
-                    trc::info!("NM-FSYNC [{:?}] syncing to {:?} ...", msg.message_id, frame);
+                    let should_loudly_log = match framesync_records.entry(inbound_msg.sender_id) {
+                        hash_map::Entry::Occupied(mut b) => {
+                            if *b.get() >= frame {
+                                // We should skip this message since we've already moved past it.
+                                continue;
+                            }
+                            // We're going to try to regulate the log to once per second
+                            let is_big_jump = *b.get() > frame + u64::from(TARGET_FPS);
+                            b.insert(frame);
+                            is_big_jump
+                        }
+                        hash_map::Entry::Vacant(a) => {
+                            a.insert(frame);
+                            true
+                        }
+                    };
+                    if should_loudly_log {
+                        trc::info!("NM-FSYNC [{:?}] syncing to {:?} ...", msg.message_id, frame);
+                    } else {
+                        trc::debug!("NM-FSYNC [{:?}] syncing to {:?} ...", msg.message_id, frame);
+                    }
                     netting_framesync.write().await.record_framesync(inbound_msg.sender_id, frame);
                 },
             }
