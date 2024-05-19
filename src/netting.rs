@@ -1,4 +1,4 @@
-use std::{alloc::Layout, collections::HashMap, io::Cursor, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{alloc::Layout, collections::HashMap, net::SocketAddr, pin::Pin, sync::Arc};
 
 use chacha::{aead::Aead, AeadCore, KeyInit};
 use chrono::{TimeDelta, Utc};
@@ -80,7 +80,7 @@ pub struct Netting {
 
 impl Netting {
     // TODO This should probably be yet another event.
-    pub async fn new() -> (Arc<Self>, Receiver<NettingMessage>) {
+    pub async fn new() -> (Arc<Self>, Receiver<InboundNettingMessage>) {
         // TODO Actually use these
         let (registry, netting_rx, force_osynt_tx, netting_tx) = PeerRegistry::new().await;
 
@@ -120,7 +120,7 @@ pub enum NettingMessageKind {
     Noop,
     NakedLogString(String),
     Handshake,
-    NewConnection(ClientId),
+    NewConnection,
     DroppedConnection {
         client_id: ClientId,
     },
@@ -147,7 +147,7 @@ impl NettingMessageKind {
         match self {
             Self::Noop => vec![0],
             Self::Handshake => vec![1],
-            Self::NewConnection(_addr) => vec![2],
+            Self::NewConnection => vec![2],
             Self::DroppedConnection { client_id: _ } => vec![3],
             Self::WorldTransfer(w) => {
                 trc::info!("NET-NM-ENCODE-WTX world: {:?}", w);
@@ -179,7 +179,7 @@ impl NettingMessageKind {
         match last_byte.expect("bytes should not be empty") {
             0 => Ok(Self::Noop),
             1 => Ok(Self::Handshake),
-            2 => Ok(Self::NewConnection(unimplemented!("this isn't really meant to be sent"))),
+            2 => Ok(Self::NewConnection),
             3 => Ok(Self::DroppedConnection { client_id: ClientId(bytes.try_into().unwrap()) }),
             4 => {
                 Ok(Self::WorldTransfer(
@@ -332,6 +332,19 @@ impl NettingMessage {
             })
         }
     }
+
+    pub fn to_inbound(self, sender_id: ClientId) -> InboundNettingMessage {
+        InboundNettingMessage {
+            sender_id,
+            msg: self,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct InboundNettingMessage {
+    pub sender_id: ClientId,
+    pub msg: NettingMessage,
 }
 
 trait NettingMessenger {
@@ -366,6 +379,7 @@ pub struct RecvReconciliationState {
 pub struct AttributedInboundBytes {
     pub decrypted_bytes: Vec<u8>,
     pub addr: SocketAddr,
+    pub client_id: ClientId,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -499,6 +513,7 @@ pub enum PeerKey {
         p256::ecdh::EphemeralSecret
     ),
     Exchanged {
+        peer_id: ClientId,
         #[derivative(Debug="ignore")]
         secret: p256::ecdh::SharedSecret,
         #[derivative(Debug="ignore")]
@@ -507,14 +522,58 @@ pub enum PeerKey {
 }
 
 impl PeerKey {
-    pub fn exchanged_from_shared_secret(shared_secret: p256::ecdh::SharedSecret) -> Self {
+    pub fn exchanged_from_shared_secret_and_raw_peer(
+        shared_secret: p256::ecdh::SharedSecret,
+        peer_id: ClientId,
+    ) -> Self {
         let mut key_buffer = [0u8; 32];
         shared_secret.extract::<sha2::Sha256>(None).expand(&[], &mut key_buffer).expect("key expansion to be fine");
         let aead_key = chacha::XChaCha20Poly1305::new(&key_buffer.into());
+
         Self::Exchanged {
+            peer_id,
             secret: shared_secret,
             key: aead_key
         }
+    }
+
+    pub fn exchanged_from_shared_secret_and_encrypted_handshake(
+        shared_secret: p256::ecdh::SharedSecret,
+        encrypted_handshake: &[u8],
+    ) -> Option<(ClientId, Self)> {
+        let mut key_buffer = [0u8; 32];
+        shared_secret.extract::<sha2::Sha256>(None).expand(&[], &mut key_buffer).expect("key expansion to be fine");
+        let aead_key = chacha::XChaCha20Poly1305::new(&key_buffer.into());
+
+        // Now use the combined key.
+        let Some(peer_client_id_and_greeting) = Self::fixed_key_aead_decrypt(&aead_key, encrypted_handshake) else {
+            return None;
+        };
+        if peer_client_id_and_greeting.len() != HANDSHAKE_GREETING.len() + ClientId::LEN {
+            return None;
+        }
+        if &peer_client_id_and_greeting[..HANDSHAKE_GREETING.len()] != HANDSHAKE_GREETING {
+            return None;
+        }
+        let peer_client_id_bytes = &peer_client_id_and_greeting[HANDSHAKE_GREETING.len()..];
+        let peer_client_id = ClientId([
+            peer_client_id_bytes[0],
+            peer_client_id_bytes[1],
+            peer_client_id_bytes[2],
+            peer_client_id_bytes[3],
+            peer_client_id_bytes[4],
+            peer_client_id_bytes[5],
+            peer_client_id_bytes[6],
+            peer_client_id_bytes[7],
+            peer_client_id_bytes[8],
+        ]);
+
+
+        Some((peer_client_id, Self::Exchanged {
+            peer_id: peer_client_id,
+            secret: shared_secret,
+            key: aead_key
+        }))
     }
 
     pub fn fixed_nonce_aead_encrypt(&self, aead_nonce: &[u8], cleartext: &[u8], buffer: &mut [u8]) -> usize {
@@ -537,15 +596,14 @@ impl PeerKey {
         self.fixed_nonce_aead_encrypt(aead_nonce.as_slice(), cleartext, buffer)
     }
 
-    pub fn aead_decrypt(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
-        let Self::Exchanged { key: ref aead_key, .. } = self else { return None; };
+    fn fixed_key_aead_decrypt(key: &chacha::XChaCha20Poly1305, ciphertext: &[u8]) -> Option<Vec<u8>> {
         // TODO remove this
         let sample_nonce = chacha::XChaCha20Poly1305::generate_nonce(&mut OsRng);
 
         let aead_nonce = &ciphertext[0..sample_nonce.len()];
         let raw_ciphertext_buffer = &ciphertext[aead_nonce.len()..];
 
-        let cleartext = match aead_key.decrypt(aead_nonce.into(), raw_ciphertext_buffer) {
+        let cleartext = match key.decrypt(aead_nonce.into(), raw_ciphertext_buffer) {
             Ok(a) => a,
             Err(e) => {
                 trc::error!("no issues expected for decryption, err: {e:?}");
@@ -554,6 +612,11 @@ impl PeerKey {
         };
 
         Some(cleartext)
+    }
+
+    pub fn aead_decrypt(&self, ciphertext: &[u8]) -> Option<(ClientId, Vec<u8>)> {
+        let Self::Exchanged { key: ref aead_key, peer_id, .. } = self else { return None; };
+        Some((*peer_id, Self::fixed_key_aead_decrypt(aead_key, ciphertext)?))
     }
 }
 
@@ -646,7 +709,7 @@ impl PeerConnectionData {
         self.active_messages[self.next_transmission_number as usize].0 = bytes_written_to_buffer;
     }
 
-    pub fn decrypt(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+    pub fn decrypt(&self, bytes: &[u8]) -> Option<(ClientId, Vec<u8>)> {
         let Some(ref k) = self.exchanged_key else {
             // TODO Handle this properly, but just drop the packet on the ground for now.
             return None;
@@ -697,7 +760,7 @@ impl PeerRegistry {
     // Returns a receiver for so that the owner of the registry can trigger a new peer connection.
     pub async fn new() -> (
         Self,
-        Receiver<NettingMessage>,
+        Receiver<InboundNettingMessage>,
         Sender<OutboundSynapseTransmission>,
         Sender<(NettingMessage, Option<SocketAddr>)>,
     ) {
@@ -810,7 +873,7 @@ impl PeerRegistry {
                             trc::debug!("NET-ISYNT-HANDSHAKE-INIT key minted");
                             // Now queue up response.
                             let handshake_internal_output_message_tx = internal_osynt_tx.clone();
-                            let combined_key = PeerKey::exchanged_from_shared_secret(shared_key);
+                            let combined_key = PeerKey::exchanged_from_shared_secret_and_raw_peer(shared_key, peer_client_id);
                             { // TODO Implement a permissioning system.
                                 // We'll write out the client id so that the exchange will also
                                 // record the client id.
@@ -880,33 +943,11 @@ impl PeerRegistry {
                             trc::info!("NET-ISYNT-HANDSHAKE-RESP wrapping up initiator ecdh");
                             let peer_public = PublicKey::from_sec1_bytes(peer_public_bytes).unwrap();
                             let shared_key = own_secret.diffie_hellman(&peer_public);
-                            let combined_key = PeerKey::exchanged_from_shared_secret(shared_key);
-
-                            // Now use the combined key.
-                            let Some(peer_client_id_and_greeting) = combined_key.aead_decrypt(ciphertext) else {
-                                // Bad packet, deny.
+                            let Some((peer_client_id, combined_key)) = PeerKey::exchanged_from_shared_secret_and_encrypted_handshake(shared_key, ciphertext) else {
+                                // Something went wrong with the handshake, this is not legitimate.
+                                // Deny this.
                                 break 'response_end;
                             };
-                            if peer_client_id_and_greeting.len() != HANDSHAKE_GREETING.len() + ClientId::LEN {
-                                // Bad packet, deny.
-                                break 'response_end;
-                            }
-                            if &peer_client_id_and_greeting[..HANDSHAKE_GREETING.len()] != HANDSHAKE_GREETING {
-                                // Bad packet, deny.
-                                break 'response_end;
-                            }
-                            let peer_client_id_bytes = &peer_client_id_and_greeting[HANDSHAKE_GREETING.len()..];
-                            let peer_client_id = ClientId([
-                                peer_client_id_bytes[0],
-                                peer_client_id_bytes[1],
-                                peer_client_id_bytes[2],
-                                peer_client_id_bytes[3],
-                                peer_client_id_bytes[4],
-                                peer_client_id_bytes[5],
-                                peer_client_id_bytes[6],
-                                peer_client_id_bytes[7],
-                                peer_client_id_bytes[8],
-                            ]);
 
                             connection_data.exchanged_key = Some(combined_key);
                             trc::debug!("NET-ISYNT-HANDSHAKE-RESP complete");
@@ -929,7 +970,7 @@ impl PeerRegistry {
                                 // We aren't connected, reject their request.
                                 break 'known_packet_end;
                             };
-                            let Some(decrypted_bytes) = connection_data.decrypt(&isynt.bytes) else {
+                            let Some((client_id, decrypted_bytes)) = connection_data.decrypt(&isynt.bytes) else {
                                 // Crypto thinks they're terrible, ignore their message.
                                 break 'known_packet_end;
                             };
@@ -946,6 +987,7 @@ impl PeerRegistry {
                             inbound_known_tx.send(AttributedInboundBytes {
                                 decrypted_bytes,
                                 addr: sender_addr,
+                                client_id,
                             }).await.expect("channel to not be closed");
 
                             ack_fut.await.expect("no issues sending ack");
@@ -1088,22 +1130,22 @@ impl PeerRegistry {
             // TODO Periodically clean up old values.
             let mut cached_partials: HashMap<_, Vec<NettingMessageBytesWithOrdering>> = HashMap::new();
             loop {
-                let msg = match inbound_known_rx.recv().await {
+                let known_msg = match inbound_known_rx.recv().await {
                     Some(data) => { data },
                     None => {
                         trc::error!("tx channel to not be dropped");
                         return;
                     },
                 };
-                trc::info!("NET-IKNOWN-PARSE {:?}", msg.decrypted_bytes);
-                let opt_msg = match NettingMessage::parse(msg.decrypted_bytes) {
-                    Ok(msg) => Some(msg),
+                trc::info!("NET-IKNOWN-PARSE {:?}", known_msg.decrypted_bytes);
+                let opt_msg = match NettingMessage::parse(known_msg.decrypted_bytes) {
+                    Ok(known_msg) => Some(known_msg),
                     Err(NettingMessageParseError::PartialMessage {
                         message_id,
                         expected_len,
                         msg: addressed_message_bytes,
                     }) => {
-                        let cache = cached_partials.entry((msg.addr, message_id, expected_len)).or_default();
+                        let cache = cached_partials.entry((known_msg.addr, message_id, expected_len)).or_default();
                         if cache.iter().all(|a| a.packet_index != addressed_message_bytes.packet_index) {
                             cache.push(addressed_message_bytes);
                         }
@@ -1112,7 +1154,7 @@ impl PeerRegistry {
                             .sum::<u64>();
                         if loaded_byte_count == expected_len {
                             cache.sort_by_key(|a| a.packet_index);
-                            let cache = cached_partials.remove(&(msg.addr, message_id, expected_len)).expect("value I just had to be here");
+                            let cache = cached_partials.remove(&(known_msg.addr, message_id, expected_len)).expect("value I just had to be here");
                             let combined_message_bytes = expected_len.to_be_bytes().into_iter()
                                 .chain(message_id.to_be_bytes())
                                 .chain(cache.into_iter().flat_map(|a| a.bytes.into_iter()))
@@ -1133,7 +1175,7 @@ impl PeerRegistry {
                     // If we couldn't load a message, we're done for the loop, carry on!
                     continue;
                 };
-                inbound_raw_netting_tx.send(msg).await.expect("rx channel to not be dropped");
+                inbound_raw_netting_tx.send(msg.to_inbound(known_msg.client_id)).await.expect("rx channel to not be dropped");
             }
         });
 
@@ -1148,7 +1190,7 @@ impl PeerRegistry {
                     client_id: peer_id,
                     local_addr: addr,
                 });
-                inbound_sibling_netting_tx.send(NettingMessageKind::NewConnection(peer_id).to_msg()).await.expect("it's okay");
+                inbound_sibling_netting_tx.send(NettingMessageKind::NewConnection.to_msg().to_inbound(peer_id)).await.expect("it's okay");
             }
         });
 

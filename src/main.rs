@@ -1,10 +1,11 @@
 mod netting;
 
-use std::{cell::RefCell, collections::VecDeque, net::IpAddr, sync::{atomic::AtomicBool, Arc}};
+use std::{cell::RefCell, collections::{HashMap, VecDeque}, net::IpAddr, ops::{Bound, Range, RangeInclusive}, sync::{atomic::AtomicBool, Arc}};
 
 use chrono::{Duration, DateTime, Utc};
 use bincode::{Encode, Decode};
 
+use netting::ClientId;
 use tokio::sync::{mpsc::{self, error::TryRecvError}, RwLock};
 
 use crate::netting::{NettingMessageKind, NettingMessage};
@@ -296,60 +297,118 @@ impl WorldStash {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+/// Stashes away the "more/less" bounds on the timeline.
+///
+/// Due to wraparound, this has a single discontinuous point. But the center is also a
+/// discontinuous point, so we need 4 potential ranges to fully represent the thing.
+#[derive(Debug, Clone)]
 pub struct FrameWindowingRanges {
+    pub center: u64,
 }
 
 impl FrameWindowingRanges {
     fn new(center: u64) -> Self {
         Self {
+            center,
         }
     }
 
     fn signed_distance(&self, input: u64) -> i64 {
-        0
+        let data = input.wrapping_sub(self.center);
+        if data > u64::MAX / 2 {
+            // This is the realm of negative distances.
+            -((data - u64::MAX / 2) as i64)
+        } else {
+            data as i64
+        }
     }
+
     fn is_wraparound(&self, input: u64) -> bool {
-        false
+        input.wrapping_sub(self.center) > input
     }
 }
 
 pub struct FrameSync {
-    pub center: u64,
-    range_cache: RefCell<Option<FrameWindowingRanges>>,
+    historical_framesyncs: HashMap<ClientId, (chrono::DateTime<chrono::Utc>, u64)>,
+    range_cache: RwLock<Option<FrameWindowingRanges>>,
 }
 
 impl FrameSync {
     const FRAME_MILLISECONDS: u16 = 1000 / TARGET_FPS;
     /// We'll tolerate ~ 2 seconds of being ahead -- that's (currently) around how long it
     /// takes to make two round trips around the globe.
-    const LOOKAHEAD_TOLERANCE: u16 = 2000 / Self::FRAME_MILLISECONDS;
+    const PEER_LAG_TOLERANCE: u16 = 2000 / Self::FRAME_MILLISECONDS;
     /// This is the bottom window of frames we're expecting from across the network. We won't have
     /// an upper limit, since the upper limit doesn't really exist.
-    const VALIDITY_WINDOW_LOWER_DISTANCE: i64 = Self::LOOKAHEAD_TOLERANCE as i64 * 2;
+    const VALIDITY_WINDOW_LOWER_DISTANCE: i64 = Self::PEER_LAG_TOLERANCE as i64 * 2;
     const VALIDITY_WINDOW_UPPER_DISTANCE: i64 = 9999;
+    /// We'll allow old data up to two times the lookahead tolerance. This should let us get away
+    /// with using u16s as the frame integer type, but I'm lazy.
+    const DATA_AGE_LIMIT: chrono::TimeDelta = chrono::TimeDelta::milliseconds(Self::PEER_LAG_TOLERANCE as i64 * 2);
 
-    pub fn new(center: u64) -> Self {
+    pub fn new() -> Self {
         Self {
-            center,
-            range_cache: RefCell::new(None),
+            historical_framesyncs: HashMap::new(),
+            range_cache: RwLock::new(None),
         }
     }
 
-    fn get_ranges(&self) -> FrameWindowingRanges {
-        let mut cache = self.range_cache.borrow_mut();
-        let data = if let Some(ref r) = *cache { *r } else {
-            let r = FrameWindowingRanges::new(self.center);
-            *cache = Some(r);
-            r
+    /// To bust cache, set range_cache to None.
+    async fn get_ranges(&self, center: u64) -> FrameWindowingRanges {
+        let mut cache = self.range_cache.write().await;
+        let data = match *cache {
+            Some(ref r) if r.center == center => r.clone(),
+            _ => {
+                let r = FrameWindowingRanges::new(center);
+                *cache = Some(r.clone());
+                r
+            },
         };
         data
     }
 
+    pub fn record_framesync(&mut self, peer: ClientId, frame: u64) {
+        self.historical_framesyncs.insert(peer, (Utc::now(), frame));
+    }
+
+    pub async fn calculate_delay(&self, position: u64) -> Option<chrono::TimeDelta> {
+        let earliest_allowed_timestamp = Utc::now() - Self::DATA_AGE_LIMIT;
+        // First find the "earliest" frame synchronized. We'll use this as the limiting factor.
+        let mut limiter = None;
+        for (&peer, &(update_timestamp, frame)) in self.historical_framesyncs.iter() {
+            if update_timestamp < earliest_allowed_timestamp {
+                continue;
+            }
+            let Some((_wraparound, signed_distance)) = self.signed_distance(position, frame).await else {
+                // Since this is "too far" aka the peer is problematic, we'll just ignore them.
+                trc::warn!("FRAMESYNC-PEER-IGNORE peer={peer:?} frame={frame:?}");
+                continue;
+            };
+            trc::trace!("FRAMESYNC-DIST peer={peer:?} frame={frame:?} distance={signed_distance:?}");
+            let Some(prev) = limiter else {
+                trc::trace!("FRAMESYNC-LIMITER-UPDATE peer={peer:?} frame={frame:?} distance={signed_distance:?}");
+                limiter = Some((peer, frame, signed_distance));
+                continue;
+            };
+            if signed_distance < prev.2 {
+                trc::trace!("FRAMESYNC-LIMITER-UPDATE peer={peer:?} frame={frame:?} distance={signed_distance:?}");
+                limiter = Some((peer, frame, signed_distance));
+            } else {
+                limiter = Some(prev);
+            }
+        }
+        trc::debug!("FRAMESYNC-LIMITER-RECORD limiter={limiter:?}");
+        // If we don't have an earliest frame, assume we're alone and proceed as if we can
+        // continue.
+        let (_, limiting_frame, _) = limiter?;
+
+        self.required_delay(position, limiting_frame).await
+    }
+
     /// Returns Some((is_wraparound, signed_distance)).
     /// Returns None if this value should be ignored.
-    pub fn signed_distance(&self, input: u64) -> Option<(bool, i64)> {
-        let r = self.get_ranges();
+    async fn signed_distance(&self, position: u64, input: u64) -> Option<(bool, i64)> {
+        let r = self.get_ranges(position).await;
         let distance = r.signed_distance(input);
         if distance < -Self::VALIDITY_WINDOW_LOWER_DISTANCE || distance > Self::VALIDITY_WINDOW_UPPER_DISTANCE {
             return None;
@@ -357,15 +416,15 @@ impl FrameSync {
         Some((r.is_wraparound(input), distance))
     }
 
-    pub fn required_delay(&self, input: u64) -> Option<chrono::TimeDelta> {
-        let r = self.get_ranges();
+    async fn required_delay(&self, position: u64, input: u64) -> Option<chrono::TimeDelta> {
+        let r = self.get_ranges(position).await;
         let distance = r.signed_distance(input);
-        if distance > -(Self::LOOKAHEAD_TOLERANCE as i64) {
+        if distance > -(Self::PEER_LAG_TOLERANCE as i64) {
             return None;
         }
 
         // We don't want to wait too long in case the network catchs up to us -- hence the min(20).
-        let frames_to_wait = (distance + (Self::LOOKAHEAD_TOLERANCE as i64)).min(20);
+        let frames_to_wait = (distance + (Self::PEER_LAG_TOLERANCE as i64)).min(20);
         Some(chrono::TimeDelta::milliseconds(Self::FRAME_MILLISECONDS as i64 * frames_to_wait as i64))
     }
 }
@@ -385,13 +444,15 @@ async fn main() {
     // Systems setup
     let world_stash = Arc::new(RwLock::new(WorldStash::new(World::default())));
     let (netting, mut netting_msg_rx) = netting::Netting::new().await;
+    let framesync = Arc::new(RwLock::new(FrameSync::new()));
     // let (input_tx, input_rx) = mpsc::channel::<Input>();
     // let game_complete = AtomicBool::new(false);
 
     let sim_world_stash = Arc::clone(&world_stash);
+    let sim_netting = Arc::clone(&netting);
     let (sim_run_state_tx, mut sim_run_state_rx) = mpsc::channel::<bool>(10);
     let (sim_force_jump_tx, mut sim_force_jump_rx) = mpsc::channel::<Option<(chrono::DateTime<chrono::Utc>, u64)>>(10);
-    let (sim_framesync_tx, mut sim_framesync_rx) = mpsc::channel::<u64>(10);
+    let sim_framesync = Arc::clone(&framesync);
     let sim_running = Arc::new(AtomicBool::new(false));
     let sim_running_internal = Arc::clone(&sim_running);
     let _sim_handle = tokio::spawn(async move {
@@ -402,7 +463,6 @@ async fn main() {
 
             // The world loops repeatedly.
             let mut target_sim_time = Utc::now();
-            let mut expected_global_frame = 0;
             loop {
                 let now = Utc::now();
                 if now < target_sim_time {
@@ -437,47 +497,10 @@ async fn main() {
                 // TODO force fixed wake up
                 sim_world_stash.write().await.historical_worlds.push_back(working_world);
 
-                let mut framesyncing = true;
-                let mut framesyncing_frame = None;
-                let framesync_limits = None;
-                let framesyncing_data = FrameSync::new(working_world_generation);
-                while framesyncing {
-                    match sim_framesync_rx.try_recv() {
-                        Ok(frame) => {
-                            // TODO
-                            // Also, tolerance... it should take ages to wrap around so just assume
-                            // it's alright.
-                            let should_ignore = if frame < working_world_generation {
-                            } else {
-                                d
-                            } > TOLERANCE;
-                            if is_wraparound || framesyncing_frame.map(|tracking_min| tracking_min >= frame).unwrap_or(true) {
-                                framesyncing_frame = Some(frame);
-                            }
-                        },
-                        Err(TryRecvError::Empty) => {
-                            // Do nothing, we'll proceed to the next loop since there's no need to
-                            // wait or we've already set the relevant values.
-                            framesyncing = false;
-                        },
-                        Err(TryRecvError::Disconnected) => {
-                            panic!("should still be connected");
-                        },
-                    }
-                }
-
-                // TODO Handle single player mode by ignoring 
-                if let Some(framesyncing_frame) = framesyncing_frame {
-                    let offset = framesyncing_frame - working_world_generation;
-                    if framesyncing_frame < working_world_generation - SIM_LOOKAHEAD_TOLERANCE.min(working_world_generation) {
-                        // We'll add an extra delay to the next frame while we wait. This
-                        // is a bit of a hack, but should be okay.
-                        let frames_ahead = framesyncing_frame - working_world_generation;
-                        // We'll only delay for part of the frame in case the network comes through and
-                        // we manage to catch up.
-                        let frame_delay = frames_ahead.min(20).try_into().expect("min should trim off overflow");
-                        target_sim_time += chrono::TimeDelta::milliseconds(1000 / 20) * frame_delay;
-                    }
+                sim_netting.broadcast(NettingMessageKind::FrameSync(working_world_generation).to_msg()).await;
+                let framesync_reader = sim_framesync.read().await;
+                if let Some(extra_required_delay) = framesync_reader.calculate_delay(working_world_generation).await {
+                    target_sim_time -= extra_required_delay;
                 }
 
                 target_sim_time += chrono::TimeDelta::milliseconds(1000 / 20);
@@ -490,12 +513,13 @@ async fn main() {
     let sim_running_netting = Arc::clone(&sim_running);
     let netting_sim_force_jump_tx = sim_force_jump_tx.clone();
     let netting_sim_run_state_tx = sim_run_state_tx.clone();
-    let netting_sim_framesync_tx = sim_framesync_tx.clone();
+    let netting_framesync = Arc::clone(&framesync);
     tokio::spawn(async move {
         loop {
-            let Some(msg) = netting_msg_rx.recv().await else {
+            let Some(inbound_msg) = netting_msg_rx.recv().await else {
                 continue;
             };
+            let msg = inbound_msg.msg;
             let span = trc::span!(trc::Level::TRACE, "NM-MSG", id = msg.message_id);
             let entered = span.enter();
             match msg.kind {
@@ -508,15 +532,15 @@ async fn main() {
                 NettingMessageKind::Handshake => {
                     trc::info!("NM-GREET [{:?}] {:?}", msg.message_id, msg.message_id);
                 },
-                NettingMessageKind::NewConnection(client_id) => {
-                    trc::info!("NM-CONN [{:?}] {:?}", msg.message_id, client_id);
+                NettingMessageKind::NewConnection => {
+                    trc::info!("NM-CONN [{:?}] {:?}", msg.message_id, inbound_msg.sender_id);
                     // TODO Avoid this and reconcile multiple WorldTransfers correctly, especially
                     // on startup.
                     if sim_running_netting.load(std::sync::atomic::Ordering::Acquire) {
                         // Only send if running -- this prevents needing reconciliation of game
                         // state when receiving a WorldTransfer ... for now.
                         let boxed_world = Box::new(netting_world_stash.read().await.peek_most_recent().expect("at least one world").clone());
-                        netting_netting.send_to(NettingMessageKind::WorldTransfer(boxed_world).to_msg(), client_id).await;
+                        netting_netting.send_to(NettingMessageKind::WorldTransfer(boxed_world).to_msg(), inbound_msg.sender_id).await;
                     }
                 },
                 NettingMessageKind::DroppedConnection { client_id, } => {
@@ -540,7 +564,7 @@ async fn main() {
                     unimplemented!("not yet able to handle user actions");
                 },
                 NettingMessageKind::FrameSync(frame) => {
-                    netting_sim_framesync_tx.send(frame).await.expect("connection to work");
+                    netting_framesync.write().await.record_framesync(inbound_msg.sender_id, frame);
                 },
             }
             drop(entered);
