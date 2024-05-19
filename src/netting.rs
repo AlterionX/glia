@@ -150,12 +150,12 @@ impl NettingMessageKind {
             Self::NewConnection => vec![2],
             Self::DroppedConnection { client_id: _ } => vec![3],
             Self::WorldTransfer(w) => {
-                trc::info!("NET-NM-ENCODE-WTX world: {:?}", w);
+                trc::debug!("NET-NM-ENCODE-WTX world: {:?}", w);
                 let mut bytes = bincode::encode_to_vec(
                     w,
                     bincode::config::standard()
                 ).expect("no issues encoding");
-                trc::info!("NET-NM-ENCODE-WTX bytes: {:?}", bytes);
+                trc::debug!("NET-NM-ENCODE-WTX bytes: {:?}", bytes);
                 bytes.push(4); // discriminant
                 bytes
             },
@@ -168,7 +168,9 @@ impl NettingMessageKind {
             Self::WorldSyncStart => vec![7],
             Self::WorldSyncEnd => vec![8],
             Self::FrameSync(frame) => {
-                frame.to_be_bytes().into_iter().chain(std::iter::once(9u8)).collect()
+                let b = frame.to_be_bytes().into_iter().chain(std::iter::once(9u8)).collect();
+                trc::debug!("NET-NM-ENCODE-FSYNC bytes {b:?}");
+                b
             },
         }
     }
@@ -300,7 +302,7 @@ impl NettingMessage {
         drop(bytes.drain(..2 * 8 + 1));
 
         if bytes.len() as u64 == expected_msg_len {
-            trc::info!("NET-IKNOWN-PARSE parsing kind {:?}", bytes);
+            trc::debug!("NET-IKNOWN-PARSE parsing kind {:?}", bytes);
             let kind = match NettingMessageKind::parse(bytes) {
                 Ok(k) => k,
                 Err(NettingMessageKindParseError::BadWorld(w)) => {
@@ -577,7 +579,10 @@ impl PeerKey {
     }
 
     pub fn fixed_nonce_aead_encrypt(&self, aead_nonce: &[u8], cleartext: &[u8], buffer: &mut [u8]) -> usize {
-        let Self::Exchanged { key: ref aead_key, .. } = self else { return 0; };
+        let Self::Exchanged { key: ref aead_key, .. } = self else {
+            trc::debug!("NET-ENCODE encrypt attempted without established key");
+            return 0;
+        };
 
         let nonce_buffer = &mut buffer[0..aead_nonce.len()];
         nonce_buffer.copy_from_slice(aead_nonce);
@@ -599,6 +604,11 @@ impl PeerKey {
     fn fixed_key_aead_decrypt(key: &chacha::XChaCha20Poly1305, ciphertext: &[u8]) -> Option<Vec<u8>> {
         // TODO remove this
         let sample_nonce = chacha::XChaCha20Poly1305::generate_nonce(&mut OsRng);
+
+        if ciphertext.len() < sample_nonce.len() {
+            trc::debug!("NET-DECRYPT bad message length");
+            return None;
+        }
 
         let aead_nonce = &ciphertext[0..sample_nonce.len()];
         let raw_ciphertext_buffer = &ciphertext[aead_nonce.len()..];
@@ -679,7 +689,7 @@ impl PeerConnectionData {
         if is_mismatch {
             self.recent_received_messages[isynt.transmission_number] = (now, checksum);
         }
-        is_mismatch
+        !is_mismatch
     }
 
     pub fn write_synapse_transmission(&mut self, encrypted: bool, discriminant: u8, bytes: &[u8]) {
@@ -940,17 +950,21 @@ impl PeerRegistry {
                                 // not created the key. Deny this.
                                 break 'response_end;
                             };
-                            trc::info!("NET-ISYNT-HANDSHAKE-RESP wrapping up initiator ecdh");
+                            trc::debug!("NET-ISYNT-HANDSHAKE-RESP wrapping up initiator ecdh");
                             let peer_public = PublicKey::from_sec1_bytes(peer_public_bytes).unwrap();
                             let shared_key = own_secret.diffie_hellman(&peer_public);
                             let Some((peer_client_id, combined_key)) = PeerKey::exchanged_from_shared_secret_and_encrypted_handshake(shared_key, ciphertext) else {
                                 // Something went wrong with the handshake, this is not legitimate.
                                 // Deny this.
+                                trc::debug!(
+                                    "NET-ISYNT-HANDSHAKE-RESP rejected -- encryption bad {:?}",
+                                    connection_data.exchanged_key
+                                );
                                 break 'response_end;
                             };
 
                             connection_data.exchanged_key = Some(combined_key);
-                            trc::debug!("NET-ISYNT-HANDSHAKE-RESP complete");
+                            trc::info!("NET-ISYNT-HANDSHAKE-RESP complete");
                             connection_notification_tx.send((peer_client_id, sender_addr)).await.expect("rx to be present");
 
                             ack_fut.await.expect("no issues sending ack");
@@ -958,7 +972,7 @@ impl PeerRegistry {
                         SynapseTransmissionKind::PeerDiscovery => unimplemented!("peer connection not yet working"),
                         SynapseTransmissionKind::Ack => 'ack_end: {
                             let Some(connection_data) = connections.get_mut(&sender_addr) else {
-                                trc::debug!("NET-ISYNT-ACK ignoring ack");
+                                trc::info!("NET-ISYNT-ACK ignoring ack");
                                 // We have not initiated this connection yet, this is a bad request.
                                 break 'ack_end;
                             };
@@ -966,6 +980,7 @@ impl PeerRegistry {
                             connection_data.active_messages[isynt.transmission_number].0 = 0;
                         },
                         SynapseTransmissionKind::KnownPacket => 'known_packet_end: {
+                            trc::trace!("NET-ISYNT-KNOWN recv {:?}", isynt);
                             let Some(connection_data) = connections.get_mut(&sender_addr) else {
                                 // We aren't connected, reject their request.
                                 break 'known_packet_end;
@@ -1009,7 +1024,7 @@ impl PeerRegistry {
                             // Skip entry since it's not a message
                             continue;
                         }
-                        trc::trace!("NET-WRITE writing message... {i:?} <<>> {st_len:?} <<>> {:?}", SynapseTransmissionKind::from_discriminant(st_bytes[0]));
+                        trc::debug!("NET-WRITE writing message... {i:?} <<>> {st_len:?} <<>> {:?}", SynapseTransmissionKind::from_discriminant(st_bytes[0]));
                         // We're handling disconnected sockets by crashing... maybe
                         // I'll fix this in the future, but for now...
                         let sent = match socket.send_to(&st_bytes[..*st_len], addr) {
@@ -1025,12 +1040,12 @@ impl PeerRegistry {
                             },
                         };
                         debug_assert_eq!(sent, *st_len, "sent as much bytes as in the message");
+                        trc::trace!("NET-WRITE message written len={st_len:?}");
                         // Acks will get zeroed out no matter what since they're one time send.
                         // TODO Support limited resends appropriately.
                         if st_bytes[0] == SynapseTransmissionKind::Ack.to_discriminant() {
                             *st_len = 0;
                         }
-                        trc::trace!("NET-WRITE message written");
                     }
                 }}
 
@@ -1051,7 +1066,7 @@ impl PeerRegistry {
                         Err(TryRecvError::Disconnected) => None,
                     }
                 } {
-                    trc::info!("NET-OSYNT queuing message {osynt:?}");
+                    trc::debug!("NET-OSYNT queuing message {osynt:?}");
                     let discriminant = osynt.kind.to_discriminant();
                     let (encrypted, bytes) = match &osynt.kind {
                         OutboundSynapseTransmissionKind::HandshakeInitiate => {
@@ -1081,7 +1096,7 @@ impl PeerRegistry {
                             (false, greeting_bytes)
                         },
                         OutboundSynapseTransmissionKind::HandshakeResponse => {
-                            trc::info!("NOT-OSYNT-HANDSHAKE-RESP sending");
+                            trc::info!("NET-OSYNT-HANDSHAKE-RESP sending");
                             (false, osynt.bytes)
                         },
                         OutboundSynapseTransmissionKind::Ack { .. } => {
@@ -1114,6 +1129,7 @@ impl PeerRegistry {
         let netting_to_known_task_handle = tokio::spawn(async move {
             loop {
                 let (msg, addr) = outbound_netting_rx.recv().await.expect("tx channel to not be dropped");
+                trc::info!("NET-ONM Sending {msg:?}");
                 // TODO Break apart into multiple osynts and shove through the network. Drop for
                 // now.
                 for bytes in msg.into_known_packet_bytes() {
@@ -1130,16 +1146,10 @@ impl PeerRegistry {
             // TODO Periodically clean up old values.
             let mut cached_partials: HashMap<_, Vec<NettingMessageBytesWithOrdering>> = HashMap::new();
             loop {
-                let known_msg = match inbound_known_rx.recv().await {
-                    Some(data) => { data },
-                    None => {
-                        trc::error!("tx channel to not be dropped");
-                        return;
-                    },
-                };
-                trc::info!("NET-IKNOWN-PARSE {:?}", known_msg.decrypted_bytes);
+                let known_msg = inbound_known_rx.recv().await.expect("NET-IKNOWN tx channel to not be dropped");
+                trc::debug!("NET-IKNOWN-PARSE {:?}", known_msg.decrypted_bytes);
                 let opt_msg = match NettingMessage::parse(known_msg.decrypted_bytes) {
-                    Ok(known_msg) => Some(known_msg),
+                    Ok(msg) => Some(msg),
                     Err(NettingMessageParseError::PartialMessage {
                         message_id,
                         expected_len,
@@ -1186,6 +1196,7 @@ impl PeerRegistry {
                 let Some((peer_id, addr)) = connection_notification_rx.recv().await else {
                     continue;
                 };
+                trc::info!("NET-ISYNT-CONNECTION-NOTICE connected to peer {peer_id:?}");
                 siblings_ref.write().await.push(PeerRegistryEntry {
                     client_id: peer_id,
                     local_addr: addr,
