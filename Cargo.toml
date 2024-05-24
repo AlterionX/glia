@@ -5,7 +5,11 @@ edition = "2021"
 
 [dependencies.derivative]
 version = "2"
+[dependencies.thiserror]
+version = "1"
 
+[dependencies.serde]
+version = "1"
 [dependencies.tap]
 version = "1"
 [dependencies.bytemuck]
@@ -33,6 +37,8 @@ version = "0"
 version = "1"
 features = ["full"]
 
+[dependencies.config]
+version = "0.14"
 [dependencies.trc]
 package = "tracing"
 version = "0.1"

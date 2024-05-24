@@ -50,6 +50,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clo
                     },
                     NettingMessageKind::NakedLogString(log) => {
                         trc::info!("NM-LOG [{:?}] {log:?}", msg.message_id);
+                        println!("raw log: {:?}", log);
                     },
                     NettingMessageKind::Handshake => {
                         trc::info!("NM-GREET [{:?}] {:?}", msg.message_id, msg.message_id);

@@ -1,15 +1,18 @@
-// Underlying tech modules.
+// Ops
+mod cfg;
 mod log;
+
+// Underlying tech modules.
 mod netting;
 mod simulation;
-mod renderer;
+// mod render;
 mod input;
 mod bus;
 
 // Actual game modules.
 mod world;
 
-use std::{net::IpAddr, sync::{atomic::AtomicBool, Arc}};
+use std::{error::Error, fmt::{Display, Pointer}, net::IpAddr, sync::{atomic::AtomicBool, Arc}};
 
 use chrono::{Duration, DateTime, Utc};
 
@@ -167,9 +170,37 @@ impl Renderer {
     }
 }
 
+const DEFAULT_FILE: &str = "cfg.toml";
+
 #[tokio::main]
 async fn main() {
-    log::setup();
+    match main_with_error_handler().await {
+        Ok(()) => {
+            /* do nothing */
+        },
+        Err(err) => {
+            todo!("handle error report -- {err:?}");
+        },
+    }
+}
+
+#[derive(Debug)]
+pub struct ReportableError {
+    pub message: String,
+}
+
+impl Display for ReportableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl Error for ReportableError {
+}
+
+async fn main_with_error_handler() -> Result<(), ReportableError> {
+    let cfg = Box::leak(cfg::read()?);
+    log::setup(cfg)?;
 
     // Networking channels
     let (osynt_tx, osynt_rx) = mpsc::channel(1024);

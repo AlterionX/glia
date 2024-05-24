@@ -1,12 +1,8 @@
-pub mod task;
-mod shaders;
-
-use std::{sync::Arc, collections::{HashMap, hash_map::Entry}, time::{Instant, Duration}};
+use std::{collections::{hash_map::Entry, HashMap}, sync::Arc, time::{Duration, Instant}};
 
 use img::ImageFormat;
 use raw_window_handle::HandleError;
 use tap::{TapFallible, TapOptional};
-use task::RenderTask;
 use thiserror::Error;
 
 use vulkano::{
@@ -69,6 +65,8 @@ use vulkano::{
 };
 use winit::{window::{WindowId, Window}, dpi::PhysicalSize};
 
+use crate::render::{task::RenderTask, shaders};
+
 #[derive(Debug, Default)]
 pub struct RendererPreferences {
     pub preferred_physical_device: Option<String>,
@@ -123,7 +121,7 @@ impl RendererPreferences {
             0
         };
 
-        (name_score << 1 + pdt_pref_score) * (PDT_ORD_ARR.len() + 1) + pdt_ord_score
+        ((name_score << 1) + pdt_pref_score) * (PDT_ORD_ARR.len() + 1) + pdt_ord_score
     }
 }
 
@@ -158,6 +156,69 @@ pub enum RendererInitializationError {
     ShaderLoadFail(&'static str, Validated<VulkanError>),
     #[error("surface extension enumeration: {0}")]
     SurfaceCheck(#[from] HandleError),
+}
+
+struct RenderTimer {
+    start: Instant,
+    inflight_load: Option<Instant>,
+    loads: Vec<Duration>,
+    inflight_command_record: Option<Instant>,
+    command_record_duration: Option<Duration>,
+    inflight_draw: Option<Instant>,
+    draw_duration: Option<Duration>,
+}
+
+impl RenderTimer {
+    fn begin() -> Self {
+        Self {
+            start: Instant::now(),
+            inflight_load: None,
+            loads: Vec::with_capacity(20),
+            inflight_command_record: None,
+            command_record_duration: None,
+            inflight_draw: None,
+            draw_duration: None,
+        }
+    }
+
+    fn record_load_start(&mut self) {
+        self.inflight_load = Some(Instant::now());
+    }
+
+    fn record_load_end(&mut self) {
+        let Some(start) = self.inflight_load else {
+            return;
+        };
+        self.loads.push(Instant::now() - start);
+    }
+
+    fn record_command_record_start(&mut self) {
+        self.inflight_command_record = Some(Instant::now());
+    }
+
+    fn record_command_record_end(&mut self) {
+        let Some(start) = self.inflight_command_record else {
+            return;
+        };
+        self.command_record_duration = Some(Instant::now() - start);
+    }
+
+    fn record_draw_start(&mut self) {
+        self.inflight_draw = Some(Instant::now());
+    }
+
+    fn record_draw_end(&mut self) {
+        let Some(start) = self.inflight_draw else {
+            return;
+        };
+        self.draw_duration = Some(Instant::now() - start);
+    }
+
+    fn record_end(self) {
+        let over = Instant::now() - self.start;
+        let a = 1000. / over.as_millis() as f64;
+        trc::info!("RENDER-PASS-TIMING fps={a} loads={:?} submit={:?} draw={:?} total={:?}", self.loads, self.command_record_duration, self.draw_duration, over);
+    }
 }
 
 pub struct Renderer {
@@ -209,9 +270,9 @@ pub struct Renderer {
 impl Renderer {
     pub fn init(application_name: Option<String>, application_version: Option<Version>, windowing: Arc<Window>, pref: &RendererPreferences) -> Result<Self, RendererInitializationError> {
         let vulkan_library = VulkanLibrary::new()
-            .tap_err(|e| log::error!("TOTALITY-RENDERER-INIT-FAILED primary_source=vulkan_lib error=missing_error {e}"))?;
+            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED primary_source=vulkan_lib error=missing_error {e}"))?;
         let required_extensions = Surface::required_extensions(&windowing)
-            .tap_err(|e| log::error!("TOTALITY-RENDERER-INIT-FAILED primary_source=surface_check {e}"))?;
+            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED primary_source=surface_check {e}"))?;
         let vulkan = Instance::new(
             vulkan_library,
             InstanceCreateInfo {
@@ -224,13 +285,13 @@ impl Renderer {
                 ..Default::default()
             }
         )
-            .tap_err(|e| log::error!("TOTALITY-RENDERER-INIT-FAILED source=driver error=instance {e}"))
+            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=driver error=instance {e}"))
             .map_err(RendererInitializationError::Instance)?;
 
         // Find best (most performant or preferred) valid device.
         let ordered_physical_devices = {
             let iter = vulkan.enumerate_physical_devices()
-                .tap_err(|e| log::error!("TOTALITY-RENDERER-INIT-FAILED source=physical_devices error=enumeration_failure {e}"))
+                .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=physical_devices error=enumeration_failure {e}"))
                 .map_err(RendererInitializationError::Physical)?;
             let minimum_device_extensions = DeviceExtensions {
                 khr_swapchain: true,
@@ -245,7 +306,7 @@ impl Renderer {
         let (selected_physical_device_idx, selected_queue_family_idx) = 'queue_family: {
             // Assume there's at least one physical device and that the first device is valid.
             let physical = ordered_physical_devices.first()
-                .tap_none(|| log::error!("TOTALITY-RENDERER-INIT-FAILED source=physical_devices error=no_device"))
+                .tap_none(|| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=physical_devices error=no_device"))
                 .ok_or_else(|| RendererInitializationError::NoPhysicalDevice)?;
             let queue_props = physical.queue_family_properties();
             // Just pick the first valid one for now, we'll come back.
@@ -281,7 +342,7 @@ impl Renderer {
                     ..Default::default()
                 },
             )
-                .tap_err(|e| log::error!("TOTALITY-RENDERER-INIT-FAILED source=device_queue error=failed_creation {e}"))
+                .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=device_queue error=failed_creation {e}"))
                 .map_err(RendererInitializationError::QueueCreationFailed)?;
             let queues: Vec<_> = queues_iter.collect();
             if queues.is_empty() {
@@ -318,7 +379,7 @@ impl Renderer {
             // 60 MB. Then add an extra vector.
             60 * 1024 * 1024
         )
-            .tap_err(|e| log::error!("TOTALITY-RENDERER-INIT-FAILED source=vertex_buffer error=failed_creation {e}"))
+            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=vertex_buffer error=failed_creation {e}"))
             .map_err(RendererInitializationError::BufferCreationFailed)?
         ;
         // And then for triangles.
@@ -344,7 +405,7 @@ impl Renderer {
             // 60 MB. Then add an extra vector.
             60 * 1024 * 1024
         )
-            .tap_err(|e| log::error!("TOTALITY-RENDERER-INIT-FAILED source=face_buffer error=failed_creation {e}"))
+            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=face_buffer error=failed_creation {e}"))
             .map_err(RendererInitializationError::BufferCreationFailed)?;
         // One for instanced model sets.
         let uniform_counts_buffer = Buffer::new_unsized(
@@ -367,7 +428,7 @@ impl Renderer {
             // Assuming a 4x4 32bit ...
             16,
         )
-            .tap_err(|e| log::error!("TOTALITY-RENDERER-INIT-FAILED source=count_buffer error=failed_creation {e}"))
+            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=count_buffer error=failed_creation {e}"))
             .map_err(RendererInitializationError::BufferCreationFailed)?;
         // One for instanced model sets.
         let uniform_per_mesh_buffer = Buffer::new_unsized(
@@ -390,7 +451,7 @@ impl Renderer {
             // Assuming a 4x4 32bit ...
             64 * 1024,
         )
-            .tap_err(|e| log::error!("TOTALITY-RENDERER-INIT-FAILED source=matrix_buffer error=failed_creation {e}"))
+            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=matrix_buffer error=failed_creation {e}"))
             .map_err(RendererInitializationError::BufferCreationFailed)?;
         // A light buffer...
         let uniform_light_buffer = Buffer::new_unsized(
@@ -414,7 +475,7 @@ impl Renderer {
             // 32 / 8 = 2^6 bytes per array. 2^6 * 500 = 32000. Let's just use ~50KB.
             96 * 1024,
         )
-            .tap_err(|e| log::error!("TOTALITY-RENDERER-INIT-FAILED source=matrix_buffer error=failed_creation {e}"))
+            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=matrix_buffer error=failed_creation {e}"))
             .map_err(RendererInitializationError::BufferCreationFailed)?;
         // More for materials!
         let uniform_material_buffer = Buffer::new_unsized(
@@ -438,7 +499,7 @@ impl Renderer {
             // 32 / 8 = 2^6 bytes per array. 2^6 * 500 = 32000. Let's just use ~50KB.
             16 * 1024,
         )
-            .tap_err(|e| log::error!("TOTALITY-RENDERER-INIT-FAILED source=matrix_buffer error=failed_creation {e}"))
+            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=matrix_buffer error=failed_creation {e}"))
             .map_err(RendererInitializationError::BufferCreationFailed)?;
         // And another for textures.
         let staging_texture_buffer = Buffer::new_unsized(
@@ -460,7 +521,7 @@ impl Renderer {
             },
             50 * 1024 * 1024
         )
-            .tap_err(|e| log::error!("TOTALITY-RENDERER-INIT-FAILED source=staging_texture_buffer error=failed_creation {e}"))
+            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=staging_texture_buffer error=failed_creation {e}"))
             .map_err(RendererInitializationError::BufferCreationFailed)?;
         // And a last chunk for constants.
         let constants_buffer = Buffer::new_unsized(
@@ -481,19 +542,19 @@ impl Renderer {
             },
             50 * 1024 * 1024
         )
-            .tap_err(|e| log::error!("TOTALITY-RENDERER-INIT-FAILED source=constants_buffer error=failed_creation {e}"))
+            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=constants_buffer error=failed_creation {e}"))
             .map_err(RendererInitializationError::BufferCreationFailed)?;
 
         let command_buffer_alloc = Arc::new(StandardCommandBufferAllocator::new(Arc::clone(&selected_device), StandardCommandBufferAllocatorCreateInfo::default()));
 
         let vertex_shader = shaders::basic_vert::load(Arc::clone(&selected_device))
-            .tap_err(|e| log::error!("TOTALITY-RENDERER-INIT-FAILED source=shader shader=basic_vert {e}"))
+            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=shader shader=basic_vert {e}"))
             .map_err(|e| RendererInitializationError::ShaderLoadFail("basic_vert", e))?;
         let geometry_shader = shaders::basic_geom::load(Arc::clone(&selected_device))
-            .tap_err(|e| log::error!("TOTALITY-RENDERER-INIT-FAILED source=shader shader=basic_geom {e}"))
+            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=shader shader=basic_geom {e}"))
             .map_err(|e| RendererInitializationError::ShaderLoadFail("basic_geom", e))?;
         let fragment_shader = shaders::basic_frag::load(Arc::clone(&selected_device))
-            .tap_err(|e| log::error!("TOTALITY-RENDERER-INIT-FAILED source=shader shader=basic_frag {e}"))
+            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=shader shader=basic_frag {e}"))
             .map_err(|e| RendererInitializationError::ShaderLoadFail("basic_frag", e))?;
 
         let descriptor_set_layout = DescriptorSetLayout::new(Arc::clone(&selected_device), DescriptorSetLayoutCreateInfo {
@@ -702,69 +763,6 @@ impl Renderer {
     }
 
     pub fn render_to<'a>(&mut self, window: Arc<Window>, task: RenderTask<'a>) -> Result<(), Validated<VulkanError>> {
-        struct RenderTimer {
-            start: Instant,
-            inflight_load: Option<Instant>,
-            loads: Vec<Duration>,
-            inflight_command_record: Option<Instant>,
-            command_record_duration: Option<Duration>,
-            inflight_draw: Option<Instant>,
-            draw_duration: Option<Duration>,
-        }
-
-        impl RenderTimer {
-            fn begin() -> Self {
-                Self {
-                    start: Instant::now(),
-                    inflight_load: None,
-                    loads: Vec::with_capacity(20),
-                    inflight_command_record: None,
-                    command_record_duration: None,
-                    inflight_draw: None,
-                    draw_duration: None,
-                }
-            }
-
-            fn record_load_start(&mut self) {
-                self.inflight_load = Some(Instant::now());
-            }
-
-            fn record_load_end(&mut self) {
-                let Some(start) = self.inflight_load else {
-                    return;
-                };
-                self.loads.push(Instant::now() - start);
-            }
-
-            fn record_command_record_start(&mut self) {
-                self.inflight_command_record = Some(Instant::now());
-            }
-
-            fn record_command_record_end(&mut self) {
-                let Some(start) = self.inflight_command_record else {
-                    return;
-                };
-                self.command_record_duration = Some(Instant::now() - start);
-            }
-
-            fn record_draw_start(&mut self) {
-                self.inflight_draw = Some(Instant::now());
-            }
-
-            fn record_draw_end(&mut self) {
-                let Some(start) = self.inflight_draw else {
-                    return;
-                };
-                self.draw_duration = Some(Instant::now() - start);
-            }
-
-            fn record_end(self) {
-                let over = Instant::now() - self.start;
-                let a = 1000. / over.as_millis() as f64;
-                log::info!("RENDER-PASS-TIMING fps={a} loads={:?} submit={:?} draw={:?} total={:?}", self.loads, self.command_record_duration, self.draw_duration, over);
-            }
-        }
-
         let mut perf = RenderTimer::begin();
 
 
@@ -782,13 +780,13 @@ impl Renderer {
             },
         };
 
-        log::info!("RENDER-PASS-INIT");
+        trc::info!("RENDER-PASS-INIT");
 
         {
             for draw in task.draws.iter() {
                 let mesh_id = draw.mesh.mesh_id;
                 if self.loaded_models.contains_key(&mesh_id) {
-                    log::info!("RENDER-COPY mesh={mesh_id} already_loaded=true");
+                    trc::info!("RENDER-COPY mesh={mesh_id} already_loaded=true");
                     continue;
                 }
 
@@ -798,7 +796,7 @@ impl Renderer {
                 Self::copy_sized_slice_to_buffer(&self.face_buffer.clone().slice(self.index_free_byte_start..), draw.mesh.ff.as_slice()).unwrap();
                 // We'll assume the image's format is RGB.
                 let (texture_image, texture_descriptor_set) = if let Some(ref file_path) = draw.mesh.tex_file {
-                    log::info!("RENDER-TEXTURE mesh={mesh_id} texture={file_path:?}");
+                    trc::info!("RENDER-TEXTURE mesh={mesh_id} texture={file_path:?}");
                     assert!(file_path.ends_with(".png"), "only pngs are handled, and only ARGB pngs");
                     let f = std::fs::File::open(file_path).expect("provided file exists");
                     let texture_file = img::load(std::io::BufReader::new(f), ImageFormat::Png).unwrap().into_rgb32f();
@@ -879,7 +877,7 @@ impl Renderer {
                 self.vertex_free_byte_start += vblen;
                 self.index_free_byte_start += fblen;
 
-                log::info!("RENDER-COPY mesh={mesh_id} vertex_start={} vertex_len={vblen} face_start={} face_len={fblen}", self.vertex_free_byte_start, self.index_free_byte_start);
+                trc::info!("RENDER-COPY mesh={mesh_id} vertex_start={} vertex_len={vblen} face_start={} face_len={fblen}", self.vertex_free_byte_start, self.index_free_byte_start);
 
                 perf.record_load_end();
             }
@@ -907,106 +905,102 @@ impl Renderer {
         };
 
         let subpass = Subpass::from(Arc::clone(&window_swapchain.render_pass), 0).unwrap();
-        let pipeline = GraphicsPipeline::new(
-            Arc::clone(&self.selected_device),
-            None,
-            GraphicsPipelineCreateInfo {
-                stages: [
-                    PipelineShaderStageCreateInfo::new(self.vertex_shader.entry_point("main").unwrap()),
-                    PipelineShaderStageCreateInfo::new(self.fragment_shader.entry_point("main").unwrap()),
-                    PipelineShaderStageCreateInfo::new(self.geometry_shader.entry_point("main").unwrap()),
-                ].into_iter().collect(),
-                rasterization_state: Some(RasterizationState {
-                    cull_mode: CullMode::Back,
-                    ..RasterizationState::default()
-                }),
-                input_assembly_state: Some(InputAssemblyState {
-                    topology: PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                }),
-                vertex_input_state: Some(
-                    VertexInputState::new()
-                        .binding(
-                            0,
-                            VertexInputBindingDescription {
-                                stride: 12 + 12 + 8,
-                                input_rate: VertexInputRate::Vertex,
-                                ..Default::default()
-                            },
-                        )
-                        .attribute(
-                            0,
-                            VertexInputAttributeDescription {
-                                binding: 0,
-                                format: Format::R32G32B32_SFLOAT,
-                                offset: 0,
-                                ..Default::default()
-                            },
-                        )
-                        .binding(
-                            1,
-                            VertexInputBindingDescription {
-                                stride: 12 + 12 + 8,
-                                input_rate: VertexInputRate::Vertex,
-                                ..Default::default()
-                            },
-                        )
-                        .attribute(
-                            1,
-                            VertexInputAttributeDescription {
-                                binding: 0,
-                                format: Format::R32G32B32_SFLOAT,
-                                offset: 12,
-                                ..Default::default()
-                            },
-                        )
-                        .binding(
-                            2,
-                            VertexInputBindingDescription {
-                                stride: 12 + 12 + 8,
-                                input_rate: VertexInputRate::Vertex,
-                                ..Default::default()
-                            },
-                        )
-                        .attribute(
-                            2,
-                            VertexInputAttributeDescription {
-                                binding: 0,
-                                format: Format::R32G32_SFLOAT,
-                                offset: 12 + 12,
-                                ..Default::default()
-                            },
-                        )
-                ),
-                viewport_state: Some(ViewportState {
-                    viewports: [Viewport {
-                        offset: [0.0; 2],
-                        extent: [active_framebuffer.image.extent()[0] as f32, active_framebuffer.image.extent()[1] as f32],
-                        depth_range: 0.0..=1.0
-                    }].into_iter().collect(),
-                    scissors: [Scissor {
-                        offset: [0; 2],
-                        extent: [active_framebuffer.image.extent()[0], active_framebuffer.image.extent()[1]],
-                    }].into_iter().collect(),
-                    ..ViewportState::default()
-                }),
-                multisample_state: Some(MultisampleState {
-                    rasterization_samples: SampleCount::Sample1,
-                    ..Default::default()
-                }),
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    subpass.num_color_attachments(),
-                    ColorBlendAttachmentState::default(),
-                )),
-                depth_stencil_state: Some(DepthStencilState {
-                    depth: Some(DepthState::simple()),
-                    ..Default::default()
-                }),
-                subpass: Some(PipelineSubpassType::BeginRenderPass(subpass)),
-                ..GraphicsPipelineCreateInfo::layout(Arc::clone(&self.pipeline_layout))
-            }
-        ).unwrap();
-        log::info!("RENDER-PASS-PIPELINE descriptor_set={}", pipeline.num_used_descriptor_sets());
+        let pipeline = GraphicsPipeline::new(Arc::clone(&self.selected_device), None, GraphicsPipelineCreateInfo {
+            stages: [
+                PipelineShaderStageCreateInfo::new(self.vertex_shader.entry_point("main").unwrap()),
+                PipelineShaderStageCreateInfo::new(self.fragment_shader.entry_point("main").unwrap()),
+                PipelineShaderStageCreateInfo::new(self.geometry_shader.entry_point("main").unwrap()),
+            ].into_iter().collect(),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::Back,
+                ..RasterizationState::default()
+            }),
+            input_assembly_state: Some(InputAssemblyState {
+                topology: PrimitiveTopology::TriangleList,
+                ..Default::default()
+            }),
+            vertex_input_state: Some(
+                VertexInputState::new()
+                    .binding(
+                        0,
+                        VertexInputBindingDescription {
+                            stride: 12 + 12 + 8,
+                            input_rate: VertexInputRate::Vertex,
+                            ..Default::default()
+                        },
+                    )
+                    .attribute(
+                        0,
+                        VertexInputAttributeDescription {
+                            binding: 0,
+                            format: Format::R32G32B32_SFLOAT,
+                            offset: 0,
+                            ..Default::default()
+                        },
+                    )
+                    .binding(
+                        1,
+                        VertexInputBindingDescription {
+                            stride: 12 + 12 + 8,
+                            input_rate: VertexInputRate::Vertex,
+                            ..Default::default()
+                        },
+                    )
+                    .attribute(
+                        1,
+                        VertexInputAttributeDescription {
+                            binding: 0,
+                            format: Format::R32G32B32_SFLOAT,
+                            offset: 12,
+                            ..Default::default()
+                        },
+                    )
+                    .binding(
+                        2,
+                        VertexInputBindingDescription {
+                            stride: 12 + 12 + 8,
+                            input_rate: VertexInputRate::Vertex,
+                            ..Default::default()
+                        },
+                    )
+                    .attribute(
+                        2,
+                        VertexInputAttributeDescription {
+                            binding: 0,
+                            format: Format::R32G32_SFLOAT,
+                            offset: 12 + 12,
+                            ..Default::default()
+                        },
+                    )
+            ),
+            viewport_state: Some(ViewportState {
+                viewports: [Viewport {
+                    offset: [0.0; 2],
+                    extent: [active_framebuffer.image.extent()[0] as f32, active_framebuffer.image.extent()[1] as f32],
+                    depth_range: 0.0..=1.0
+                }].into_iter().collect(),
+                scissors: [Scissor {
+                    offset: [0; 2],
+                    extent: [active_framebuffer.image.extent()[0], active_framebuffer.image.extent()[1]],
+                }].into_iter().collect(),
+                ..ViewportState::default()
+            }),
+            multisample_state: Some(MultisampleState {
+                rasterization_samples: SampleCount::Sample1,
+                ..Default::default()
+            }),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState::default(),
+            )),
+            depth_stencil_state: Some(DepthStencilState {
+                depth: Some(DepthState::simple()),
+                ..Default::default()
+            }),
+            subpass: Some(PipelineSubpassType::BeginRenderPass(subpass)),
+            ..GraphicsPipelineCreateInfo::layout(Arc::clone(&self.pipeline_layout))
+        }).unwrap();
+        trc::info!("RENDER-PASS-PIPELINE descriptor_set={}", pipeline.num_used_descriptor_sets());
 
         perf.record_command_record_start();
 
@@ -1020,8 +1014,7 @@ impl Renderer {
                 inheritance_info: None,
                 ..Default::default()
             }
-        )
-            .tap_err(|e| log::error!("TOTALITY-RENDERER-RENDER-TO-FAILED source=clear_pipeline error=command_buffer_alloc {e}"))?;
+        ).tap_err(|e| trc::error!("TOTALITY-RENDERER-RENDER-TO-FAILED source=clear_pipeline error=command_buffer_alloc {e}"))?;
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
@@ -1080,7 +1073,7 @@ impl Renderer {
             let vert_count = draw.mesh.vec_vv.len() as i32;
             let index_count = draw.mesh.ff.len() as u32;
             let instance_count = draw.instancing_information.len() as u32;
-            log::info!(
+            trc::info!(
                 "RENDER-PASS-DRAW vertex_start={} vertex_count={vert_count} index_start={} index_count={index_count} instance_start={current_instance_buffer_idx} instance_count={instance_count}",
                 handle.vertex_offset,
                 handle.index_offset,
@@ -1109,7 +1102,7 @@ impl Renderer {
                     )
             }.unwrap();
             current_instance_buffer_idx += instance_count;
-            log::info!("RENDER-PASS-DRAW-COMPLETE");
+            trc::info!("RENDER-PASS-DRAW-COMPLETE");
         }
         builder
             .end_render_pass(SubpassEndInfo { ..Default::default() })
@@ -1131,7 +1124,7 @@ impl Renderer {
         perf.record_draw_end();
 
         perf.record_end();
-        log::info!("RENDER-PASS-COMPLETE");
+        trc::info!("RENDER-PASS-COMPLETE");
 
         Ok(())
     }
@@ -1197,7 +1190,7 @@ impl RendererWindowSwapchain {
         Vec<FramebufferedImage>,
     ), Validated<VulkanError>> {
         let capabilities = pd.surface_capabilities(&surface, Default::default())
-            .tap_err(|e| log::error!("TOTALITY-RENDERER-RENDER-TO-FAILED source=surface_capability {e}"))?;
+            .tap_err(|e| trc::error!("TOTALITY-RENDERER-RENDER-TO-FAILED source=surface_capability {e}"))?;
         let dimensions = window.inner_size();
         // Assume one is available.
         let composite_alpha = capabilities.supported_composite_alpha.into_iter().next().unwrap();
@@ -1253,7 +1246,7 @@ impl RendererWindowSwapchain {
                 color: [color],
                 depth_stencil: {depth_stencil},
             },
-        ).tap_err(|e| log::error!("TOTALITY-RENDERER-RENDER-TO-FAILED source=render_pass {e}"))?;
+        ).tap_err(|e| trc::error!("TOTALITY-RENDERER-RENDER-TO-FAILED source=render_pass {e}"))?;
 
 
         let images = raw_images.into_iter().map(|image| {
@@ -1278,4 +1271,3 @@ impl RendererWindowSwapchain {
         }, images))
     }
 }
-
