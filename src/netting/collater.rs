@@ -1,12 +1,13 @@
 use std::{collections::HashMap, fmt::Debug};
 
-use tokio::{sync::mpsc::{Receiver, Sender}, task::JoinHandle};
+use tokio::{sync::{mpsc::{Receiver, Sender}, oneshot}, task::JoinHandle};
 
 use crate::netting::{NettingMessage, NettingMessageParseError};
 
 use super::{AttributedInboundBytes, InboundNettingMessage, NettingMessageBytesWithOrdering};
 
 pub struct Inputs {
+    pub kill_rx: oneshot::Receiver<()>,
     pub iknown_rx: Receiver<AttributedInboundBytes>,
 }
 
@@ -32,7 +33,21 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Collater<W>
             // TODO Periodically clean up old values.
             let mut cached_partials: HashMap<_, Vec<NettingMessageBytesWithOrdering>> = HashMap::new();
             loop {
-                let known_msg = self.inputs.iknown_rx.recv().await.expect("NET-IKNOWN tx channel to not be dropped");
+                match self.inputs.kill_rx.try_recv() {
+                    Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
+                        trc::info!("KILL net collater");
+                        return;
+                    },
+                    Err(oneshot::error::TryRecvError::Empty) => {},
+                }
+
+                let known_msg = tokio::select! {
+                    m = self.inputs.iknown_rx.recv() => match m {
+                        Some(f) => f,
+                        None => { continue; },
+                    },
+                    _ = tokio::time::sleep(chrono::Duration::milliseconds(100).to_std().unwrap()) => { continue; },
+                };
                 trc::debug!("NET-IKNOWN-PARSE {:?}", known_msg.decrypted_bytes);
                 let opt_msg = match NettingMessage::parse(known_msg.decrypted_bytes) {
                     Ok(msg) => Some(msg),

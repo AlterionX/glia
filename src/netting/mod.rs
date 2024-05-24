@@ -2,12 +2,13 @@ mod connman;
 mod collater;
 mod parceler;
 
-use std::{fmt::Debug, net::SocketAddr, sync::Arc};
+use std::{fmt::Debug, net::SocketAddr};
 
 use chrono::Utc;
 use derivative::Derivative;
 use mio::net::UdpSocket;
-use tokio::{sync::mpsc::{self, Receiver, Sender}, task::JoinHandle};
+use tap::TapFallible;
+use tokio::{sync::{mpsc::{self, Receiver, Sender, error::SendError}, oneshot}, task::JoinHandle};
 
 use crate::UserAction;
 
@@ -69,6 +70,7 @@ impl ClientId {
 
 /// Struct holding network connections
 pub struct Inputs<W> {
+    pub kill_rx: oneshot::Receiver<()>,
     pub onm_rx: Receiver<(NettingMessage<W>, Option<ClientId>)>,
     pub osynt_rx: Receiver<OutboundSynapseTransmission>,
 }
@@ -93,18 +95,31 @@ pub struct NettingJoinHandles {
 impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Netting<W> {
     pub fn init(inputs: Inputs<W>, outputs: Outputs<W>) -> Self {
         let (iknown_tx, iknown_rx) = mpsc::channel(1024);
+        let (connman_kill_tx, connman_kill_rx) = oneshot::channel();
+        let (collater_kill_tx, collater_kill_rx) = oneshot::channel();
+        let (parceler_kill_tx, parceler_kill_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            inputs.kill_rx.await.ok();
+            connman_kill_tx.send(()).ok();
+            collater_kill_tx.send(()).ok();
+            parceler_kill_tx.send(()).ok();
+        });
 
         let collater = collater::Collater::init(collater::Inputs {
+            kill_rx: collater_kill_rx,
             iknown_rx,
         }, collater::Outputs {
             inm_tx: outputs.inm_tx.clone(),
         });
         let parceler = parceler::Parceler::init(parceler::Inputs {
+            kill_rx: parceler_kill_rx,
             onm_rx: inputs.onm_rx,
         }, parceler::Outputs {
             osynt_tx: outputs.osynt_tx.clone(),
         });
         let connman = connman::ConnectionManager::init(connman::Inputs {
+            kill_rx: connman_kill_rx,
             osynt_rx: inputs.osynt_rx,
         }, connman::Outputs::init(
             outputs.osynt_tx,
@@ -144,12 +159,14 @@ impl <W> NettingApi<W> {
         }).await.expect("no issues sending");
     }
 
-    pub async fn broadcast(&self, msg: NettingMessage<W>) {
-        self.onm_tx.send((msg, None)).await.expect("no issues sending");
+    pub async fn broadcast(&self, msg: NettingMessage<W>) -> Result<(), SendError<(NettingMessage<W>, Option<ClientId>)>> {
+        self.onm_tx.send((msg, None)).await
+            .tap_err(|_| trc::warn!("netting broadcast send failed"))
     }
 
-    pub async fn send_to(&self, msg: NettingMessage<W>, peer: ClientId) {
-        self.onm_tx.send((msg, Some(peer))).await.expect("no issues sending");
+    pub async fn send_to(&self, msg: NettingMessage<W>, peer: ClientId) -> Result<(), SendError<(NettingMessage<W>, Option<ClientId>)>> {
+        self.onm_tx.send((msg, Some(peer))).await
+            .tap_err(|_| trc::warn!("netting send_to send failed"))
     }
 }
 

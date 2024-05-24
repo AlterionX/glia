@@ -1,12 +1,13 @@
 use std::fmt::Debug;
 
-use tokio::{sync::mpsc::{Receiver, Sender}, task::JoinHandle};
+use tokio::{sync::{mpsc::{Receiver, Sender}, oneshot}, task::JoinHandle};
 
 use crate::netting::{OutboundSynapseTransmission, OutboundSynapseTransmissionKind};
 
 use super::{ClientId, NettingMessage};
 
 pub struct Inputs<W> {
+    pub kill_rx: oneshot::Receiver<()>,
     pub onm_rx: Receiver<(NettingMessage<W>, Option<ClientId>)>,
 }
 
@@ -30,7 +31,21 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Parceler<W>
     pub fn start(mut self) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
-                let (msg, client_id) = self.inputs.onm_rx.recv().await.expect("tx channel to not be dropped");
+                match self.inputs.kill_rx.try_recv() {
+                    Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
+                        trc::info!("KILL net parceler");
+                        return;
+                    },
+                    Err(oneshot::error::TryRecvError::Empty) => {},
+                }
+
+                let (msg, client_id) = tokio::select! {
+                    m = self.inputs.onm_rx.recv() => match m {
+                        Some(f) => f,
+                        None => { continue; },
+                    },
+                    _ = tokio::time::sleep(chrono::Duration::milliseconds(100).to_std().unwrap()) => { continue; },
+                };
                 trc::info!("NET-ONM Sending {msg:?}");
                 // TODO Break apart into multiple osynts and shove through the network. Drop for
                 // now.

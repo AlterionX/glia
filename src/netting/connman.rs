@@ -10,7 +10,7 @@ use p256::{ecdh::EphemeralSecret, EncodedPoint, PublicKey};
 use chacha::{aead::Aead, AeadCore, KeyInit};
 
 use mio::{net::UdpSocket, Events, Interest, Poll, Token};
-use tokio::{sync::mpsc::{self, error::TryRecvError, Receiver, Sender}, task::JoinHandle};
+use tokio::{sync::{mpsc::{self, error::TryRecvError, Receiver, Sender}, oneshot}, task::JoinHandle};
 
 use crate::netting::{ClientId, NettingMessageKind, OutboundSynapseTransmissionKind, SynapseTransmission, SynapseTransmissionKind};
 
@@ -255,7 +255,7 @@ impl PeerConnectionLedger {
     pub fn idx_for_addr_or_init(&mut self, addr: SocketAddr) -> usize {
         self.idx_for_addr(addr).unwrap_or_else(|| {
             self.connections.push((addr, None, Default::default()));
-            return self.connections.len() - 1;
+            self.connections.len() - 1
         })
     }
 
@@ -353,6 +353,7 @@ impl <'a> PeerConnectionMessageIter<'a> {
 
 
 pub struct Inputs {
+    pub kill_rx: oneshot::Receiver<()>,
     pub osynt_rx: Receiver<OutboundSynapseTransmission>,
 }
 
@@ -432,6 +433,13 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> ConnectionM
 
             // TODO Make this await a bit more.
             loop {
+                match self.inputs.kill_rx.try_recv() {
+                    Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
+                        trc::info!("KILL net connman");
+                        return;
+                    },
+                    Err(oneshot::error::TryRecvError::Empty) => {},
+                }
                 tokio::time::sleep(TimeDelta::milliseconds(1).to_std().unwrap()).await;
                 self.poll.poll(&mut self.events, Some(TimeDelta::milliseconds(10).to_std().unwrap())).expect("no issues polling");
                 for event in self.events.iter() {
@@ -522,13 +530,22 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> ConnectionM
                             }
                             connection_data.exchanged_key = Some(combined_key);
 
-                            ack_fut.await.expect("no issues sending ack");
-                            handshake_internal_output_message_tx.send(OutboundSynapseTransmission {
+                            let Ok(_) = ack_fut.await else {
+                                trc::warn!("NET-ISYNT-HANDSHAKE-INIT no issues sending ack");
+                                break 'initiate_end;
+                            };
+                            let Ok(_) = handshake_internal_output_message_tx.send(OutboundSynapseTransmission {
                                 kind: OutboundSynapseTransmissionKind::HandshakeResponse,
                                 bytes: outbound_buffer,
                                 maybe_target: Some(peer_client_id),
-                            }).await.expect("channel to not be closed");
-                            self.outputs.inm_tx.send(NettingMessageKind::NewConnection.to_msg().to_inbound(peer_client_id)).await.expect("no issues sending message");
+                            }).await else {
+                                trc::warn!("NET-ISYNT-HANDSHAKE-INIT no issues internal propagation");
+                                break 'initiate_end;
+                            };
+                            let Ok(_) = self.outputs.inm_tx.send(NettingMessageKind::NewConnection.to_msg().to_inbound(peer_client_id)).await else {
+                                trc::info!("NET-ISYNT-HANDSHAKE-INIT inm_tx");
+                                break 'initiate_end;
+                            };
                         },
                         // TODO Make the HandshakeResponse send another packet to confirm.
                         // [8 bytes; mlen][mlen bytes; ciphertext][remainder; peer_secret]
@@ -590,9 +607,15 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> ConnectionM
 
                             connection_data.exchanged_key = Some(combined_key);
                             trc::info!("NET-ISYNT-HANDSHAKE-RESP complete");
-                            self.outputs.inm_tx.send(NettingMessageKind::NewConnection.to_msg().to_inbound(peer_client_id)).await.expect("no issues sending message");
+                            let Ok(_) = self.outputs.inm_tx.send(NettingMessageKind::NewConnection.to_msg().to_inbound(peer_client_id)).await else {
+                                trc::warn!("NET-ISYNT-HANDSHAKE-RESP no issues sending");
+                                break 'response_end;
+                            };
 
-                            ack_fut.await.expect("no issues sending ack");
+                            let Ok(_) = ack_fut.await else {
+                                trc::warn!("NET-ISYNT-HANDSHAKE-RESP no issues sending ack");
+                                break 'response_end;
+                            };
                         },
                         SynapseTransmissionKind::PeerDiscovery => unimplemented!("peer connection not yet working"),
                         SynapseTransmissionKind::Ack => 'ack_end: {
@@ -624,13 +647,19 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> ConnectionM
                             if connection_data.recently_received(&isynt, checksum.to_vec()) {
                                 break 'known_packet_end;
                             }
-                            self.outputs.iknown_tx.send(AttributedInboundBytes {
+                            let Ok(_) = self.outputs.iknown_tx.send(AttributedInboundBytes {
                                 decrypted_bytes,
                                 addr: sender_addr,
                                 client_id,
-                            }).await.expect("channel to not be closed");
+                            }).await else {
+                                trc::warn!("NET-ISYNT-KNOWN no issues sending");
+                                break 'known_packet_end;
+                            };
 
-                            ack_fut.await.expect("no issues sending ack");
+                            let Ok(_) = ack_fut.await else {
+                                trc::warn!("NET-ISYNT-KNOWN no issues sending ack");
+                                break 'known_packet_end;
+                            };
                         },
                     }
                 }}

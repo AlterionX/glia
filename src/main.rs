@@ -7,6 +7,7 @@ mod netting;
 mod simulation;
 // mod render;
 mod input;
+mod system;
 mod bus;
 
 // Actual game modules.
@@ -16,9 +17,9 @@ use std::{error::Error, fmt::{Display, Pointer}, net::IpAddr, sync::{atomic::Ato
 
 use chrono::{Duration, DateTime, Utc};
 
-use tokio::sync::mpsc;
+use tokio::{io::{AsyncBufRead, AsyncBufReadExt, BufReader}, sync::{mpsc, oneshot}};
 
-use crate::{netting::{NettingMessageKind, Netting, NettingApi}, simulation::Simulation, bus::Bus, world::World};
+use crate::{bus::Bus, netting::{Netting, NettingApi, NettingMessageKind}, simulation::Simulation, system::SystemBus, world::World};
 
 const TARGET_FPS: u16 = 120;
 
@@ -213,6 +214,13 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
     let (request_snapshot_tx, request_snapshot_rx) = mpsc::channel(1);
     let (force_world_reset_tx, force_world_reset_rx) = mpsc::channel(10);
     let sim_running = Arc::new(AtomicBool::new(false));
+    // System/Render channels
+    let (window_tx, window_rx) = mpsc::channel(10);
+    let (net_kill_tx, net_kill_rx) = oneshot::channel();
+    let (sim_kill_tx, sim_kill_rx) = oneshot::channel();
+    let (bus_kill_tx, bus_kill_rx) = oneshot::channel();
+    let (sys_kill_tx, sys_kill_rx) = oneshot::channel();
+    let (tio_kill_tx, mut tio_kill_rx) = oneshot::channel();
 
     let net_api = NettingApi {
         osynt_tx: osynt_tx.clone(),
@@ -221,6 +229,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
 
     // Systems setup
     let net = Netting::<World>::init(netting::Inputs {
+        kill_rx: net_kill_rx,
         onm_rx,
         osynt_rx,
     }, netting::Outputs {
@@ -228,6 +237,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
         osynt_tx: osynt_tx.clone(),
     });
     let bus = Bus::init(bus::Inputs {
+        kill_rx: bus_kill_rx,
         sim_running: Arc::clone(&sim_running),
         inm_rx,
     }, bus::Outputs {
@@ -239,6 +249,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
         net_api: net_api.clone(),
     });
     let sim = Simulation::<_, UserAction>::init(simulation::Inputs {
+        kill_rx: sim_kill_rx,
         run_state_rx,
         force_jump_rx,
         request_snapshot_rx,
@@ -248,64 +259,129 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
     }, simulation::Outputs {
         running: Arc::clone(&sim_running),
     });
+    // let ren = Render::init(render::Inputs {
+    //     kill_rx: ren_kill_rx,
+    // }, render:::Outputs {
+    // });
+    let sys = SystemBus::init(system::Inputs {
+        kill_rx: sys_kill_rx,
+    }, system::Outputs {
+        window_tx,
+        kill_txs: vec![
+            ("net", net_kill_tx),
+            ("sim", sim_kill_tx),
+            ("bus", bus_kill_tx),
+            ("sys", sys_kill_tx),
+            ("tio", tio_kill_tx),
+        ],
+    });
+
+    tokio::spawn(async move {
+        // Input buffer
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+
+        // We're running some tests for connecting, need to input thing.
+        println!("Connect to? (Do not connect on both clients. Hit enter once connected to proceed to message sending.)");
+        let line = loop {
+            tokio::select! {
+                _ = tokio::time::sleep(chrono::Duration::milliseconds(100).to_std().unwrap()) => {
+                    match tio_kill_rx.try_recv() {
+                        Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
+                            trc::info!("KILL tio");
+                            return;
+                        },
+                        Err(oneshot::error::TryRecvError::Empty) => {},
+                    }
+                },
+                read_line = lines.next_line() => match read_line {
+                    Ok(Some(l)) => {
+                        break l;
+                    },
+                    Ok(None) => {},
+                    Err(_) => {
+                        trc::warn!("can't read stdin");
+                        return;
+                    },
+                }
+            }
+        };
+        let addr = line.trim();
+        println!("Will attempt to connect to {addr:?}...");
+        if sim_running.load(std::sync::atomic::Ordering::Acquire) {
+            trc::info!("Skipping peer -- already connected to mesh");
+        } else {
+            // Also initiate game state
+            // TODO resolve race condition of multiple connections
+            run_state_tx.send(true).await.expect("no problems kicking off game loop");
+            net_api.create_peer_connection(addr.parse().unwrap()).await;
+        }
+
+        loop {
+            println!("Enter string to send");
+            let line = loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(chrono::Duration::milliseconds(100).to_std().unwrap()) => {
+                        match tio_kill_rx.try_recv() {
+                            Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
+                                trc::info!("KILL tio");
+                                return;
+                            },
+                            Err(oneshot::error::TryRecvError::Empty) => {},
+                        }
+                    },
+                    read_line = lines.next_line() => match read_line {
+                        Ok(Some(l)) => {
+                            break l;
+                        },
+                        Ok(None) => {},
+                        Err(_) => {
+                            trc::warn!("can't read stdin");
+                            return;
+                        },
+                    }
+                }
+            };
+            let msg = line.trim();
+            let Ok(_) = net_api.broadcast(NettingMessageKind::NakedLogString(msg.to_owned()).to_msg()).await else {
+                break;
+            };
+        }
+
+        // thread::scope(|s| {
+        //     let actions_since_sync: Vec<UserAction> = vec![];
+        //     let worlds_since_sync: Vec<(DateTime<Utc>, World)> = vec![];
+
+        //     let network_input_thread = s.spawn(|| loop {
+        //         if game_complete.load(Ordering::Relaxed) {
+        //             break;
+        //         }
+
+        //         // Read user input, network events and rearrange them. Also manage periodic sync.
+        //         // Also ruthlessly kill connections if they haven't been around for a minute. Not
+        //         // sure how the game world will react to this, though.
+        //     });
+
+        //     let main_thread = s.spawn(|| 'main_loop: loop {
+        //         'round_loop: loop {
+        //             match world.tick() {
+        //                 ControlFlow::Continue => {
+        //                 },
+        //                 ControlFlow::RoundComplete => {
+        //                     break 'round_loop;
+        //                 },
+        //                 ControlFlow::GameComplete => {
+        //                     break 'main_loop;
+        //                 },
+        //             }
+        //         }
+        //     });
+        // });
+    });
 
     let net_handle = net.start();
     let bus_handle = bus.start();
     let sim_handle = sim.start();
-
-    // Input buffer
-    let mut input = String::new();
-
-    // We're running some tests for connecting, need to input thing.
-    println!("Connect to? (Do not connect on both clients. Hit enter once connected to proceed to message sending.)");
-    std::io::stdin().read_line(&mut input).unwrap();
-    let addr = input.trim();
-    println!("Will attempt to connect to {addr:?}...");
-    if sim_running.load(std::sync::atomic::Ordering::Acquire) {
-        trc::info!("Skipping peer -- already connected to mesh");
-    } else {
-        // Also initiate game state
-        // TODO resolve race condition of multiple connections
-        run_state_tx.send(true).await.expect("no problems kicking off game loop");
-        net_api.create_peer_connection(addr.parse().unwrap()).await;
-    }
-    input.truncate(0);
-
-    loop {
-        println!("Enter string to send");
-        std::io::stdin().read_line(&mut input).unwrap();
-        let msg = input.trim();
-        net_api.broadcast(NettingMessageKind::NakedLogString(msg.to_owned()).to_msg()).await;
-        input.truncate(0);
-    }
-
-    // thread::scope(|s| {
-    //     let actions_since_sync: Vec<UserAction> = vec![];
-    //     let worlds_since_sync: Vec<(DateTime<Utc>, World)> = vec![];
-
-    //     let network_input_thread = s.spawn(|| loop {
-    //         if game_complete.load(Ordering::Relaxed) {
-    //             break;
-    //         }
-
-    //         // Read user input, network events and rearrange them. Also manage periodic sync.
-    //         // Also ruthlessly kill connections if they haven't been around for a minute. Not
-    //         // sure how the game world will react to this, though.
-    //     });
-
-    //     let main_thread = s.spawn(|| 'main_loop: loop {
-    //         'round_loop: loop {
-    //             match world.tick() {
-    //                 ControlFlow::Continue => {
-    //                 },
-    //                 ControlFlow::RoundComplete => {
-    //                     break 'round_loop;
-    //                 },
-    //                 ControlFlow::GameComplete => {
-    //                     break 'main_loop;
-    //                 },
-    //             }
-    //         }
-    //     });
-    // });
+    sys.takeover_thread().map_err(|_| {
+        ReportableError { message: "system ended abnormally".to_owned() }
+    })
 }

@@ -252,9 +252,6 @@ pub struct RenderThread<'a> {
 
 impl<'a> RenderThread<'a> {
     fn new(sim_state: Arc<Mutex<SimState>>, window: &Arc<Window>) -> Self {
-        let preferences = RendererPreferences::default();
-        let renderer = Renderer::init(Some("totality-render-demo".to_owned()), None, Arc::clone(window), &preferences).unwrap();
-
         let mut alloc = MeshAlloc::new();
         // Load up! This one's a simple triangle.
         let triangle_mesh = Box::leak(Box::new(TriMeshGeom::triangle(

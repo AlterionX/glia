@@ -76,6 +76,8 @@ pub struct SnapshotWorldState<W> {
 }
 
 pub struct Inputs<W> {
+    /// This informs if the simulation should kill itself.
+    pub kill_rx: oneshot::Receiver<()>,
     /// This informs the simulation to begin execution or to pause.
     pub run_state_rx: Receiver<bool>,
     /// This informs us that we need to do a full reset of the world.
@@ -101,6 +103,7 @@ pub struct Outputs {
 }
 
 pub struct Simulation<W, A> {
+    kill_rx: oneshot::Receiver<()>,
     running: Arc<AtomicBool>,
     world_stash: WorldStash<W, A>,
     framesync: FrameSync,
@@ -116,6 +119,7 @@ pub struct Simulation<W, A> {
 impl <W: Default + Clone, A> Simulation<W, A> {
     pub fn init(inputs: Inputs<W>, outputs: Outputs) -> Simulation<W, A> {
         Simulation {
+            kill_rx: inputs.kill_rx,
             running: Arc::clone(&outputs.running),
             world_stash: WorldStash::new(W::default()),
             run_state_rx: inputs.run_state_rx,
@@ -127,7 +131,6 @@ impl <W: Default + Clone, A> Simulation<W, A> {
             net_api: inputs.net_api,
         }
     }
-
 }
 
 pub trait SynchronizedSimulatable {
@@ -146,8 +149,20 @@ impl<
     pub fn start(mut self) -> SimulationHandle {
         let sim_handle = tokio::spawn(async move {
             loop {
+                match self.kill_rx.try_recv() {
+                    Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
+                        trc::info!("KILL sim");
+                        return;
+                    },
+                    Err(oneshot::error::TryRecvError::Empty) => {},
+                }
+
                 self.running.store(false, std::sync::atomic::Ordering::Relaxed);
-                while !self.run_state_rx.recv().await.expect("run state rx to not be broken") { }
+                while let Some(run_state) = self.run_state_rx.recv().await {
+                    if run_state {
+                        break;
+                    }
+                }
                 self.running.store(true, std::sync::atomic::Ordering::Relaxed);
 
                 // The world loops repeatedly.
@@ -156,18 +171,16 @@ impl<
                     let now = Utc::now();
                     if now < target_sim_time {
                         tokio::select! {
-                            Some(msg) = self.force_jump_rx.recv() => {
-                                if let Some((
-                                    target_arrival_time,
-                                    _target_generation,
-                                )) = msg {
+                            opt_msg = self.force_jump_rx.recv() => match opt_msg {
+                                Some(Some((target_arrival_time, _target_generation))) => {
                                     // This means we're hard resetting and need to reset counters.
                                     trc::info!("SIM-RESET resetting catchup target to {target_arrival_time:?}");
                                     target_sim_time = target_arrival_time + (now - target_arrival_time);
-                                } else {
+                                },
+                                None | Some(None) => {
                                     // This means we're still aiming for the same target generation --
                                     // no changes other than cancelling the sleep is needed.
-                                }
+                                },
                             },
                             _ = tokio::time::sleep((target_sim_time - now).to_std().unwrap()) => {},
                         }
@@ -193,7 +206,9 @@ impl<
                     // TODO force fixed wake up
                     self.world_stash.push_world(next_working_world);
 
-                    self.net_api.broadcast(NettingMessageKind::FrameSync(working_world_generation).to_msg()).await;
+                    let Ok(()) = self.net_api.broadcast(NettingMessageKind::FrameSync(working_world_generation).to_msg()).await else {
+                        break;
+                    };
                     if let Some(extra_required_delay) = self.framesync.calculate_delay(working_world_generation).await {
                         target_sim_time -= extra_required_delay;
                     }
@@ -202,7 +217,9 @@ impl<
                     while let Ok(snapshot_request) = self.request_snapshot_rx.try_recv() {
                         // TODO Determine if we're inbetween frames in the future and properly
                         // calculate frame time offset.
-                        snapshot_request.send(snapshot.get_or_insert_with(|| self.world_stash.snapshot()).clone()).expect("receiver for snapshot to be present");
+                        let Ok(_) = snapshot_request.send(snapshot.get_or_insert_with(|| self.world_stash.snapshot()).clone()) else {
+                            break;
+                        };
                     }
 
                     target_sim_time += chrono::TimeDelta::milliseconds(1000 / i64::from(super::TARGET_FPS));
@@ -275,15 +292,14 @@ impl FrameSync {
     /// To bust cache, set range_cache to None.
     async fn get_ranges(&self, center: u64) -> FrameWindowingRanges {
         let mut cache = self.range_cache.write().await;
-        let data = match *cache {
+        match *cache {
             Some(ref r) if r.center == center => r.clone(),
-            _ => {
+            None | Some(_) => {
                 let r = FrameWindowingRanges::new(center);
                 *cache = Some(r.clone());
                 r
             },
-        };
-        data
+        }
     }
 
     pub fn record_framesync(&mut self, peer: ClientId, frame: u64) {
@@ -334,7 +350,7 @@ impl FrameSync {
         let r = self.get_ranges(position).await;
         let distance = r.signed_distance(input);
         trc::info!("FRAMESYNC-SIGNED-DISTANCE position={position:?} input={input:?}");
-        if distance < -Self::VALIDITY_WINDOW_LOWER_DISTANCE || distance > Self::VALIDITY_WINDOW_UPPER_DISTANCE {
+        if !(-Self::VALIDITY_WINDOW_LOWER_DISTANCE..=Self::VALIDITY_WINDOW_UPPER_DISTANCE).contains(&distance) {
             return None;
         }
         Some((r.is_wraparound(input), distance))

@@ -7,6 +7,7 @@ use crate::{netting::{ClientId, InboundNettingMessage, NettingApi, NettingMessag
 
 pub struct Inputs<W> {
     pub sim_running: Arc<AtomicBool>,
+    pub kill_rx: oneshot::Receiver<()>,
     pub inm_rx: Receiver<InboundNettingMessage<W>>,
 }
 
@@ -38,8 +39,20 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clo
             let mut framesync_records = HashMap::new();
 
             loop {
-                let Some(inbound_msg) = self.inputs.inm_rx.recv().await else {
-                    continue;
+                match self.inputs.kill_rx.try_recv() {
+                    Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
+                        trc::info!("KILL bus");
+                        return;
+                    },
+                    Err(oneshot::error::TryRecvError::Empty) => {},
+                }
+
+                let inbound_msg = tokio::select! {
+                    m = self.inputs.inm_rx.recv() => match m {
+                        Some(f) => f,
+                        None => { continue; },
+                    },
+                    _ = tokio::time::sleep(chrono::Duration::milliseconds(100).to_std().unwrap()) => { continue; },
                 };
                 let msg = inbound_msg.msg;
                 let span = trc::span!(trc::Level::TRACE, "NM-MSG", id = msg.message_id);
@@ -63,7 +76,9 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clo
                             // Only send if running -- this prevents needing reconciliation of game
                             // state when receiving a WorldTransfer ... for now.
                             let (world_tx, world_rx) = oneshot::channel();
-                            self.outputs.request_snapshot_tx.send(world_tx).await.expect("sending to be fine");
+                            let Ok(_) = self.outputs.request_snapshot_tx.send(world_tx).await else {
+                                continue;
+                            };
                             let stashed_net_api = self.outputs.net_api.clone();
                             // Just drop the handle on the ground, it's fine.
                             tokio::spawn(async move {
@@ -71,7 +86,9 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clo
                                     return;
                                 };
                                 let kind = NettingMessageKind::WorldTransfer(Box::new(snapshot.next));
-                                stashed_net_api.send_to(kind.to_msg(), inbound_msg.sender_id).await;
+                                let Ok(_) = stashed_net_api.send_to(kind.to_msg(), inbound_msg.sender_id).await else {
+                                    return;
+                                };
                             });
                         }
                     },
@@ -90,7 +107,9 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clo
                         self.outputs.force_world_reset_tx.send(*w).await.expect("rx to still exist");
                         self.outputs.force_jump_tx.send(Some((Utc::now(), gen))).await.expect("everything to be linked");
                         // Kickstart! This will get ignored if we're already running, so it's all good.
-                        self.outputs.run_state_tx.send(true).await.expect("everything to be linked");
+                        let Ok(_) = self.outputs.run_state_tx.send(true).await else {
+                            continue;
+                        };
                     },
                     NettingMessageKind::User(_ua) => {
                         unimplemented!("not yet able to handle user actions");
@@ -117,7 +136,9 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clo
                         } else {
                             trc::debug!("NM-FSYNC [{:?}] syncing to {:?} ...", msg.message_id, frame);
                         }
-                        self.outputs.framesync_recv_tx.send((inbound_msg.sender_id, frame)).await.expect("sending to be fine");
+                        let Ok(_) = self.outputs.framesync_recv_tx.send((inbound_msg.sender_id, frame)).await else {
+                            continue;
+                        };
                     },
                 }
                 drop(entered);
