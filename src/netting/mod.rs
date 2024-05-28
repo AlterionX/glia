@@ -100,6 +100,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Netting<W> 
         let (parceler_kill_tx, parceler_kill_rx) = oneshot::channel();
 
         tokio::spawn(async move {
+            trc::info!("KILL net");
             inputs.kill_rx.await.ok();
             connman_kill_tx.send(()).ok();
             collater_kill_tx.send(()).ok();

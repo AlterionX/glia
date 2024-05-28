@@ -12,7 +12,7 @@ use chacha::{aead::Aead, AeadCore, KeyInit};
 use mio::{net::UdpSocket, Events, Interest, Poll, Token};
 use tokio::{sync::{mpsc::{self, error::TryRecvError, Receiver, Sender}, oneshot}, task::JoinHandle};
 
-use crate::netting::{ClientId, NettingMessageKind, OutboundSynapseTransmissionKind, SynapseTransmission, SynapseTransmissionKind};
+use crate::{exec, netting::{ClientId, NettingMessageKind, OutboundSynapseTransmissionKind, SynapseTransmission, SynapseTransmissionKind}};
 
 use super::{AttributedInboundBytes, InboundNettingMessage, OutboundSynapseTransmission};
 
@@ -433,12 +433,11 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> ConnectionM
 
             // TODO Make this await a bit more.
             loop {
-                match self.inputs.kill_rx.try_recv() {
-                    Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
-                        trc::info!("KILL net connman");
-                        return;
-                    },
-                    Err(oneshot::error::TryRecvError::Empty) => {},
+                if exec::kill_requested(&mut self.inputs.kill_rx) {
+                    trc::info!("KILL net connman");
+                    return;
+                } else {
+                    trc::info!("KILL NOT net-connman");
                 }
                 tokio::time::sleep(TimeDelta::milliseconds(1).to_std().unwrap()).await;
                 self.poll.poll(&mut self.events, Some(TimeDelta::milliseconds(10).to_std().unwrap())).expect("no issues polling");
@@ -476,7 +475,21 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> ConnectionM
                     let isynt = SynapseTransmission::parse_datagram(dg);
 
                     let oneshot_ack_tx = self.ack_tx.clone();
-                    let ack_fut = async move { oneshot_ack_tx.send((isynt.transmission_number, sender_addr)).await };
+                    // This is try_send so that it avoids blocking. Theoretically, this is fine
+                    // since we need to reject identical messages anyways.
+                    let ack_fut = async move {
+                        match oneshot_ack_tx.try_send((isynt.transmission_number, sender_addr)) {
+                            Ok(_) => Ok(()),
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                // We couldn't send it -- we'll just drop it.
+                                Ok(())
+                            },
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(v)) => {
+                                // We're good to drop the message -- no one wants it anyways.
+                                Err(tokio::sync::mpsc::error::SendError(v))
+                            },
+                        }
+                    };
 
                     match isynt.kind {
                         // [5 bytes; hello][9 bytes client id][remainder; peer_secret]

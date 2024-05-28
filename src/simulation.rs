@@ -154,7 +154,9 @@ impl<
                         trc::info!("KILL sim");
                         return;
                     },
-                    Err(oneshot::error::TryRecvError::Empty) => {},
+                    Err(oneshot::error::TryRecvError::Empty) => {
+                        trc::info!("KILL NOT sim");
+                    },
                 }
 
                 self.running.store(false, std::sync::atomic::Ordering::Relaxed);

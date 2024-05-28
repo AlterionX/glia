@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::{collections::VecDeque, fmt::Debug};
 
 use tokio::{sync::{mpsc::{Receiver, Sender}, oneshot}, task::JoinHandle};
 
@@ -30,13 +30,16 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Parceler<W>
 
     pub fn start(mut self) -> JoinHandle<()> {
         tokio::spawn(async move {
+            let mut cached_unsent_osynts = VecDeque::with_capacity(5);
             loop {
                 match self.inputs.kill_rx.try_recv() {
                     Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
                         trc::info!("KILL net parceler");
                         return;
                     },
-                    Err(oneshot::error::TryRecvError::Empty) => {},
+                    Err(oneshot::error::TryRecvError::Empty) => {
+                        trc::info!("KILL NOT net-parceler");
+                    },
                 }
 
                 let (msg, client_id) = tokio::select! {
@@ -50,11 +53,32 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Parceler<W>
                 // TODO Break apart into multiple osynts and shove through the network. Drop for
                 // now.
                 for bytes in msg.into_known_packet_bytes() {
-                    self.outputs.osynt_tx.send(OutboundSynapseTransmission {
+                    let osynt = OutboundSynapseTransmission {
                         kind: OutboundSynapseTransmissionKind::KnownPacket,
                         bytes,
                         maybe_target: client_id,
-                    }).await.expect("rx channel to not be dropped");
+                    };
+                    cached_unsent_osynts.push_back(osynt);
+                }
+
+                // Can't just block since we're going to check if we need to die soon.
+                //
+                // It's alright to set a timeout and stash the message for later since we expect to
+                // die very soon -- we *probably* won't run out of memory. But in case we do,
+                // something else is too inefficient so we probably don't want to function anyways.
+                // How to fix this is an unanswered question.
+                while let Some(inm) = cached_unsent_osynts.pop_front() {
+                    match self.outputs.osynt_tx.try_send(inm) {
+                        Ok(()) => {},
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(v)) => {
+                            cached_unsent_osynts.push_front(v);
+                            // We couldn't send it -- check if we need to kill the collater.
+                            break;
+                        },
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            // We're good to drop the message -- no one wants it anyways.
+                        },
+                    }
                 }
             }
         })

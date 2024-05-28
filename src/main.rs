@@ -1,6 +1,7 @@
 // Ops
 mod cfg;
 mod log;
+mod exec;
 
 // Underlying tech modules.
 mod netting;
@@ -171,8 +172,6 @@ impl Renderer {
     }
 }
 
-const DEFAULT_FILE: &str = "cfg.toml";
-
 #[tokio::main]
 async fn main() {
     match main_with_error_handler().await {
@@ -290,7 +289,9 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
                             trc::info!("KILL tio");
                             return;
                         },
-                        Err(oneshot::error::TryRecvError::Empty) => {},
+                        Err(oneshot::error::TryRecvError::Empty) => {
+                            trc::info!("KILL NOT tio");
+                        },
                     }
                 },
                 read_line = lines.next_line() => match read_line {
@@ -326,7 +327,9 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
                                 trc::info!("KILL tio");
                                 return;
                             },
-                            Err(oneshot::error::TryRecvError::Empty) => {},
+                            Err(oneshot::error::TryRecvError::Empty) => {
+                                trc::info!("KILL NOT tio");
+                            },
                         }
                     },
                     read_line = lines.next_line() => match read_line {

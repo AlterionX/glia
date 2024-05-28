@@ -44,7 +44,9 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clo
                         trc::info!("KILL bus");
                         return;
                     },
-                    Err(oneshot::error::TryRecvError::Empty) => {},
+                    Err(oneshot::error::TryRecvError::Empty) => {
+                        trc::info!("KILL NOT bus");
+                    },
                 }
 
                 let inbound_msg = tokio::select! {

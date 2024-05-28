@@ -1,8 +1,8 @@
-use std::{collections::HashMap, fmt::Debug};
+use std::{collections::{HashMap, VecDeque}, fmt::Debug};
 
 use tokio::{sync::{mpsc::{Receiver, Sender}, oneshot}, task::JoinHandle};
 
-use crate::netting::{NettingMessage, NettingMessageParseError};
+use crate::{exec, netting::{NettingMessage, NettingMessageParseError}};
 
 use super::{AttributedInboundBytes, InboundNettingMessage, NettingMessageBytesWithOrdering};
 
@@ -30,15 +30,13 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Collater<W>
 
     pub fn start(mut self) -> JoinHandle<()> {
         tokio::spawn(async move {
+            let mut cached_unsent_netting_messages = VecDeque::with_capacity(5);
             // TODO Periodically clean up old values.
             let mut cached_partials: HashMap<_, Vec<NettingMessageBytesWithOrdering>> = HashMap::new();
             loop {
-                match self.inputs.kill_rx.try_recv() {
-                    Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
-                        trc::info!("KILL net collater");
-                        return;
-                    },
-                    Err(oneshot::error::TryRecvError::Empty) => {},
+                if exec::kill_requested(&mut self.inputs.kill_rx) {
+                    trc::info!("KILL net collater");
+                    return;
                 }
 
                 let known_msg = tokio::select! {
@@ -49,6 +47,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Collater<W>
                     _ = tokio::time::sleep(chrono::Duration::milliseconds(100).to_std().unwrap()) => { continue; },
                 };
                 trc::debug!("NET-IKNOWN-PARSE {:?}", known_msg.decrypted_bytes);
+                trc::info!("WTFFFFFFF");
                 let opt_msg = match NettingMessage::parse(known_msg.decrypted_bytes) {
                     Ok(msg) => Some(msg),
                     Err(NettingMessageParseError::PartialMessage {
@@ -82,11 +81,31 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Collater<W>
                         None
                     },
                 };
-                let Some(msg) = opt_msg else {
-                    // If we couldn't load a message, we're done for the loop, carry on!
-                    continue;
-                };
-                self.outputs.inm_tx.send(msg.to_inbound(known_msg.client_id)).await.expect("rx channel to not be dropped");
+                if let Some(msg) = opt_msg {
+                    // If we couldn't load a message, we're done with the current message. Pop it
+                    // in the cache otherwise and move on!
+                    cached_unsent_netting_messages.push_back(msg.to_inbound(known_msg.client_id));
+                }
+
+                // Can't just block since we're going to check if we need to die soon.
+                //
+                // It's alright to set a timeout and stash the message for later since we expect to
+                // die very soon -- we *probably* won't run out of memory. But in case we do,
+                // something else is too inefficient so we probably don't want to function anyways.
+                // How to fix this is an unanswered question.
+                while let Some(inm) = cached_unsent_netting_messages.pop_front() {
+                    match self.outputs.inm_tx.try_send(inm) {
+                        Ok(()) => {},
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(v)) => {
+                            cached_unsent_netting_messages.push_front(v);
+                            // We couldn't send it -- check if we need to kill the collater.
+                            break;
+                        },
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            // We're good to drop the message -- no one wants it anyways.
+                        },
+                    }
+                }
             }
         })
     }
