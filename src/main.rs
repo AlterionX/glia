@@ -177,15 +177,13 @@ fn main() {
         .enable_all()
         .build()
         .unwrap();
-    rt.block_on(async {
-        match main_with_error_handler().await {
-            Ok(()) => { /* do nothing */ },
-            Err(err) => {
-                todo!("handle error report -- {err:?}");
-            },
-        }
-    });
-    rt.shutdown_timeout(TimeDelta::milliseconds(100).to_std().unwrap());
+    rt.block_on(async { match main_with_error_handler().await {
+        Ok(()) => { /* do nothing */ },
+        Err(err) => {
+            todo!("handle error report -- {err:?}");
+        },
+    }});
+    rt.shutdown_timeout(TimeDelta::milliseconds(10).to_std().unwrap());
 }
 
 #[derive(Debug)]

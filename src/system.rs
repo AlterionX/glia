@@ -2,7 +2,7 @@ use std::sync::{atomic::{AtomicBool, AtomicUsize}, Arc};
 
 use chrono::TimeDelta;
 use tokio::{sync::{mpsc::{Receiver, Sender}, oneshot}, task::JoinHandle};
-use winit::{application::ApplicationHandler, error::EventLoopError, event::WindowEvent, event_loop::EventLoop, window::Window};
+use winit::{application::ApplicationHandler, error::EventLoopError, event::{KeyEvent, WindowEvent}, event_loop::EventLoop, keyboard::{KeyCode, PhysicalKey}, window::Window};
 
 use crate::exec;
 
@@ -55,6 +55,17 @@ impl ApplicationHandler for WindowingManager {
             WindowEvent::Destroyed => {},
             WindowEvent::Moved(_) => {},
             WindowEvent::Touch(_) => {},
+            WindowEvent::KeyboardInput { device_id: _, event, is_synthetic: _ } => match event.physical_key {
+                PhysicalKey::Code(code) => match code {
+                    KeyCode::Escape => {
+                        trc::info!("SYS -- Close requested (keyboard)");
+                        self.should_exit = true;
+                    },
+                    KeyCode::Backquote => {},
+                    _ => {},
+                },
+                PhysicalKey::Unidentified(_) => {},
+            },
             _ => {
                 trc::trace!("Unknown even {event:?}");
             },
@@ -111,15 +122,16 @@ impl SystemBus {
             std::thread::sleep(chrono::TimeDelta::milliseconds(100).to_std().unwrap());
         }
 
-        let handle = tokio::spawn(async move {
-            for (i, task) in tokio::runtime::Handle::current().dump().await.tasks().iter().enumerate() {
-                trc::info!("GLIA (only one task expected) tokio dump {}", i);
-                trc::info!("{}", task.trace());
-            }
-        });
-        while !handle.is_finished() {}
-
         let tokio_metrics = tokio::runtime::Handle::current().metrics();
+        if tokio_metrics.active_tasks_count() != 0 {
+            let handle = tokio::spawn(async move {
+                for (i, task) in tokio::runtime::Handle::current().dump().await.tasks().iter().enumerate() {
+                    trc::info!("GLIA (only one task expected) tokio dump {}", i);
+                    trc::info!("{}", task.trace());
+                }
+            });
+            while !handle.is_finished() {}
+        }
         trc::info!(
             "GLIA terminated, shutting down tokio --- remaining tasks: {:?} --- remaining injected tasks: {:?} ---- blocking threads: {:?} ---- idle threads: {:?}",
             tokio_metrics.active_tasks_count(),
@@ -127,7 +139,6 @@ impl SystemBus {
             tokio_metrics.num_blocking_threads(),
             tokio_metrics.num_idle_blocking_threads(),
         );
-        // tokio::runtime::shutdown_timeout(TimeDelta::milliseconds(500).to_std().unwrap());
 
         Ok(())
     }
