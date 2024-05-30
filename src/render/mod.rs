@@ -3,7 +3,7 @@ use std::sync::{atomic::AtomicUsize, Arc};
 use tokio::{sync::{mpsc::Receiver, oneshot}, task::JoinHandle};
 use winit::window::Window;
 
-use crate::exec;
+use crate::exec::{self, ReceiverTimeoutExt};
 
 // use self::renderer::{Renderer, RendererPreferences};
 
@@ -63,8 +63,10 @@ impl Render {
                     }
 
                     // Skip over non-recent render requests to get the most recent.
-                    let mut initial = self.inputs.trigger_render_rx.recv().await.expect("render task value to be present");
-                    while let Some(next_initial) = self.inputs.trigger_render_rx.try_recv().ok() {
+                    let Some(mut initial) = self.inputs.trigger_render_rx.recv_for_ms(100).await.value() else {
+                        continue;
+                    };
+                    while let Ok(next_initial) = self.inputs.trigger_render_rx.try_recv() {
                         initial = next_initial;
                     }
                     // TODO Actually handle the responses.
@@ -91,7 +93,7 @@ impl Render {
 }
 
 fn determine_sim_draw_calls() -> Vec<()> {
-    todo!("menu not implemented");
+    vec![]
 }
 
 fn determine_menu_draw_calls() -> Vec<()> {
