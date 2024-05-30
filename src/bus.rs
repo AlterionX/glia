@@ -1,14 +1,15 @@
-use std::{collections::{hash_map, HashMap}, fmt::Debug, sync::{atomic::AtomicBool, Arc}};
+use std::{collections::{hash_map, HashMap}, fmt::Debug, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}};
 
 use chrono::{DateTime, Utc};
 use tokio::{task::JoinHandle, sync::{mpsc::{Sender, Receiver}, oneshot}};
 
-use crate::{netting::{ClientId, InboundNettingMessage, NettingApi, NettingMessageKind}, simulation::{SnapshotWorldState, SynchronizedSimulatable}};
+use crate::{exec, netting::{ClientId, InboundNettingMessage, NettingApi, NettingMessageKind}, simulation::{SnapshotWorldState, SynchronizedSimulatable}};
 
 pub struct Inputs<W> {
     pub sim_running: Arc<AtomicBool>,
     pub kill_rx: oneshot::Receiver<()>,
     pub inm_rx: Receiver<InboundNettingMessage<W>>,
+    pub death_tally: Arc<AtomicUsize>,
 }
 
 pub struct Outputs<W> {
@@ -34,19 +35,14 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clo
     }
 
     pub fn start(mut self) -> JoinHandle<()> {
-        tokio::spawn(async move {
+        exec::spawn_kill_reporting(self.inputs.death_tally, async move {
             // Local record to avoid lock contention.
             let mut framesync_records = HashMap::new();
 
             loop {
-                match self.inputs.kill_rx.try_recv() {
-                    Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
-                        trc::info!("KILL bus");
-                        return;
-                    },
-                    Err(oneshot::error::TryRecvError::Empty) => {
-                        trc::info!("KILL NOT bus");
-                    },
+                if exec::kill_requested(&mut self.inputs.kill_rx) {
+                    trc::info!("KILL bus");
+                    return;
                 }
 
                 let inbound_msg = tokio::select! {

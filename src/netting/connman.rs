@@ -1,4 +1,4 @@
-use std::{alloc::Layout, fmt::Debug, net::SocketAddr, pin::Pin};
+use std::{alloc::Layout, fmt::Debug, net::SocketAddr, pin::Pin, sync::{atomic::AtomicUsize, Arc}};
 
 use derivative::Derivative;
 
@@ -355,6 +355,7 @@ impl <'a> PeerConnectionMessageIter<'a> {
 pub struct Inputs {
     pub kill_rx: oneshot::Receiver<()>,
     pub osynt_rx: Receiver<OutboundSynapseTransmission>,
+    pub death_tally: Arc<AtomicUsize>,
 }
 
 pub struct Outputs<W> {
@@ -422,7 +423,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> ConnectionM
     }
 
     pub fn start(mut self) -> JoinHandle<()> {
-        tokio::spawn(async move {
+        exec::spawn_kill_reporting(self.inputs.death_tally, async move {
             self.poll.registry().register(&mut self.outputs.socket, Self::OWN_PORT_TOPIC, Interest::READABLE | Interest::WRITABLE).unwrap();
             let mut dg_buf_mem = [0u8; MAX_UDP_DG_SIZE];
             let dg_buf = dg_buf_mem.as_mut_slice();
@@ -436,8 +437,6 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> ConnectionM
                 if exec::kill_requested(&mut self.inputs.kill_rx) {
                     trc::info!("KILL net connman");
                     return;
-                } else {
-                    trc::info!("KILL NOT net-connman");
                 }
                 tokio::time::sleep(TimeDelta::milliseconds(1).to_std().unwrap()).await;
                 self.poll.poll(&mut self.events, Some(TimeDelta::milliseconds(10).to_std().unwrap())).expect("no issues polling");

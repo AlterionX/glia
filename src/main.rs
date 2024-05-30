@@ -14,9 +14,9 @@ mod bus;
 // Actual game modules.
 mod world;
 
-use std::{error::Error, fmt::{Display, Pointer}, net::IpAddr, sync::{atomic::AtomicBool, Arc}};
+use std::{error::Error, fmt::{Display, Pointer}, net::IpAddr, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}};
 
-use chrono::{Duration, DateTime, Utc};
+use chrono::{DateTime, Duration, TimeDelta, Utc};
 
 use tokio::{io::{AsyncBufRead, AsyncBufReadExt, BufReader}, sync::{mpsc, oneshot}};
 
@@ -172,16 +172,20 @@ impl Renderer {
     }
 }
 
-#[tokio::main]
-async fn main() {
-    match main_with_error_handler().await {
-        Ok(()) => {
-            /* do nothing */
-        },
-        Err(err) => {
-            todo!("handle error report -- {err:?}");
-        },
-    }
+fn main() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        match main_with_error_handler().await {
+            Ok(()) => { /* do nothing */ },
+            Err(err) => {
+                todo!("handle error report -- {err:?}");
+            },
+        }
+    });
+    rt.shutdown_timeout(TimeDelta::milliseconds(100).to_std().unwrap());
 }
 
 #[derive(Debug)]
@@ -215,11 +219,14 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
     let sim_running = Arc::new(AtomicBool::new(false));
     // System/Render channels
     let (window_tx, window_rx) = mpsc::channel(10);
-    let (net_kill_tx, net_kill_rx) = oneshot::channel();
+    let (net_connman_kill_tx, net_connman_kill_rx) = oneshot::channel();
+    let (net_parceler_kill_tx, net_parceler_kill_rx) = oneshot::channel();
+    let (net_collater_kill_tx, net_collater_kill_rx) = oneshot::channel();
     let (sim_kill_tx, sim_kill_rx) = oneshot::channel();
     let (bus_kill_tx, bus_kill_rx) = oneshot::channel();
     let (sys_kill_tx, sys_kill_rx) = oneshot::channel();
     let (tio_kill_tx, mut tio_kill_rx) = oneshot::channel();
+    let death_tally = Arc::new(AtomicUsize::new(0));
 
     let net_api = NettingApi {
         osynt_tx: osynt_tx.clone(),
@@ -228,9 +235,12 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
 
     // Systems setup
     let net = Netting::<World>::init(netting::Inputs {
-        kill_rx: net_kill_rx,
+        connman_kill_rx: net_connman_kill_rx,
+        collater_kill_rx: net_collater_kill_rx,
+        parceler_kill_rx: net_parceler_kill_rx,
         onm_rx,
         osynt_rx,
+        death_tally: Arc::clone(&death_tally),
     }, netting::Outputs {
         inm_tx,
         osynt_tx: osynt_tx.clone(),
@@ -239,6 +249,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
         kill_rx: bus_kill_rx,
         sim_running: Arc::clone(&sim_running),
         inm_rx,
+        death_tally: Arc::clone(&death_tally),
     }, bus::Outputs {
         request_snapshot_tx,
         force_world_reset_tx,
@@ -255,6 +266,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
         force_world_reset_rx,
         framesync_recv_rx,
         net_api: net_api.clone(),
+        death_tally: Arc::clone(&death_tally),
     }, simulation::Outputs {
         running: Arc::clone(&sim_running),
     });
@@ -264,10 +276,13 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
     // });
     let sys = SystemBus::init(system::Inputs {
         kill_rx: sys_kill_rx,
+        death_tally: Arc::clone(&death_tally),
     }, system::Outputs {
         window_tx,
         kill_txs: vec![
-            ("net", net_kill_tx),
+            ("net-collater", net_collater_kill_tx),
+            ("net-connman", net_connman_kill_tx),
+            ("net-parceler", net_parceler_kill_tx),
             ("sim", sim_kill_tx),
             ("bus", bus_kill_tx),
             ("sys", sys_kill_tx),
@@ -275,7 +290,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
         ],
     });
 
-    tokio::spawn(async move {
+    exec::spawn_kill_reporting(death_tally, async move {
         // Input buffer
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
 
@@ -284,14 +299,9 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
         let line = loop {
             tokio::select! {
                 _ = tokio::time::sleep(chrono::Duration::milliseconds(100).to_std().unwrap()) => {
-                    match tio_kill_rx.try_recv() {
-                        Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
-                            trc::info!("KILL tio");
-                            return;
-                        },
-                        Err(oneshot::error::TryRecvError::Empty) => {
-                            trc::info!("KILL NOT tio");
-                        },
+                    if exec::kill_requested(&mut tio_kill_rx) {
+                        trc::info!("KILL tio");
+                        return;
                     }
                 },
                 read_line = lines.next_line() => match read_line {
@@ -317,7 +327,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
             net_api.create_peer_connection(addr.parse().unwrap()).await;
         }
 
-        loop {
+        'main_loop: loop {
             println!("Enter string to send");
             let line = loop {
                 tokio::select! {
@@ -325,11 +335,9 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
                         match tio_kill_rx.try_recv() {
                             Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
                                 trc::info!("KILL tio");
-                                return;
+                                break 'main_loop;
                             },
-                            Err(oneshot::error::TryRecvError::Empty) => {
-                                trc::info!("KILL NOT tio");
-                            },
+                            Err(oneshot::error::TryRecvError::Empty) => {},
                         }
                     },
                     read_line = lines.next_line() => match read_line {
@@ -349,36 +357,6 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
                 break;
             };
         }
-
-        // thread::scope(|s| {
-        //     let actions_since_sync: Vec<UserAction> = vec![];
-        //     let worlds_since_sync: Vec<(DateTime<Utc>, World)> = vec![];
-
-        //     let network_input_thread = s.spawn(|| loop {
-        //         if game_complete.load(Ordering::Relaxed) {
-        //             break;
-        //         }
-
-        //         // Read user input, network events and rearrange them. Also manage periodic sync.
-        //         // Also ruthlessly kill connections if they haven't been around for a minute. Not
-        //         // sure how the game world will react to this, though.
-        //     });
-
-        //     let main_thread = s.spawn(|| 'main_loop: loop {
-        //         'round_loop: loop {
-        //             match world.tick() {
-        //                 ControlFlow::Continue => {
-        //                 },
-        //                 ControlFlow::RoundComplete => {
-        //                     break 'round_loop;
-        //                 },
-        //                 ControlFlow::GameComplete => {
-        //                     break 'main_loop;
-        //                 },
-        //             }
-        //         }
-        //     });
-        // });
     });
 
     let net_handle = net.start();

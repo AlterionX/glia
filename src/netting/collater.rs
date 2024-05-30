@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, VecDeque}, fmt::Debug};
+use std::{collections::{HashMap, VecDeque}, fmt::Debug, sync::{atomic::AtomicUsize, Arc}};
 
 use tokio::{sync::{mpsc::{Receiver, Sender}, oneshot}, task::JoinHandle};
 
@@ -9,6 +9,7 @@ use super::{AttributedInboundBytes, InboundNettingMessage, NettingMessageBytesWi
 pub struct Inputs {
     pub kill_rx: oneshot::Receiver<()>,
     pub iknown_rx: Receiver<AttributedInboundBytes>,
+    pub death_tally: Arc<AtomicUsize>,
 }
 
 pub struct Outputs<W> {
@@ -29,7 +30,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Collater<W>
     }
 
     pub fn start(mut self) -> JoinHandle<()> {
-        tokio::spawn(async move {
+        exec::spawn_kill_reporting(self.inputs.death_tally, async move {
             let mut cached_unsent_netting_messages = VecDeque::with_capacity(5);
             // TODO Periodically clean up old values.
             let mut cached_partials: HashMap<_, Vec<NettingMessageBytesWithOrdering>> = HashMap::new();

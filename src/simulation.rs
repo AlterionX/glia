@@ -1,9 +1,9 @@
-use std::{collections::{HashMap, VecDeque}, fmt::Debug, sync::{atomic::AtomicBool, Arc}};
+use std::{collections::{HashMap, VecDeque}, fmt::Debug, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}};
 
 use chrono::{DateTime, Utc};
 use tokio::{sync::{mpsc::Receiver, oneshot, RwLock}, task::JoinHandle};
 
-use crate::netting::{ClientId, NettingApi, NettingMessageKind};
+use crate::{exec, netting::{ClientId, NettingApi, NettingMessageKind}};
 
 // TODO use a triple buffer with some network-related niceties
 #[derive(Default)]
@@ -94,6 +94,7 @@ pub struct Inputs<W> {
     pub force_world_reset_rx: Receiver<W>,
     pub net_api: NettingApi<W>,
     pub framesync_recv_rx: Receiver<(ClientId, u64)>,
+    pub death_tally: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -112,6 +113,7 @@ pub struct Simulation<W, A> {
     force_world_reset_rx: Receiver<W>,
     request_snapshot_rx: Receiver<oneshot::Sender<SnapshotWorldState<W>>>,
     framesync_recv_rx: Receiver<(ClientId, u64)>,
+    death_tally: Arc<AtomicUsize>,
 
     net_api: NettingApi<W>,
 }
@@ -128,6 +130,7 @@ impl <W: Default + Clone, A> Simulation<W, A> {
             request_snapshot_rx: inputs.request_snapshot_rx,
             framesync_recv_rx: inputs.framesync_recv_rx,
             framesync: FrameSync::new(),
+            death_tally: inputs.death_tally,
             net_api: inputs.net_api,
         }
     }
@@ -147,16 +150,23 @@ impl<
     A: Send + 'static
 > Simulation<W, A> {
     pub fn start(mut self) -> SimulationHandle {
-        let sim_handle = tokio::spawn(async move {
+        // let actions_since_sync: Vec<UserAction> = vec![];
+        // let worlds_since_sync: Vec<(DateTime<Utc>, World)> = vec![];
+
+        // let network_input_thread = s.spawn(|| loop {
+        //     if game_complete.load(Ordering::Relaxed) {
+        //         break;
+        //     }
+        //     // Read user input, network events and rearrange them. Also manage periodic sync.
+        //     // Also ruthlessly kill connections if they haven't been around for a minute. Not
+        //     // sure how the game world will react to this, though.
+        // });
+
+        let sim_handle = exec::spawn_kill_reporting(self.death_tally, async move {
             loop {
-                match self.kill_rx.try_recv() {
-                    Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
-                        trc::info!("KILL sim");
-                        return;
-                    },
-                    Err(oneshot::error::TryRecvError::Empty) => {
-                        trc::info!("KILL NOT sim");
-                    },
+                if exec::kill_requested(&mut self.kill_rx) {
+                    trc::info!("KILL sim");
+                    return;
                 }
 
                 self.running.store(false, std::sync::atomic::Ordering::Relaxed);

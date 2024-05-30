@@ -1,14 +1,15 @@
-use std::{collections::VecDeque, fmt::Debug};
+use std::{collections::VecDeque, fmt::Debug, sync::{atomic::AtomicUsize, Arc}};
 
 use tokio::{sync::{mpsc::{Receiver, Sender}, oneshot}, task::JoinHandle};
 
-use crate::netting::{OutboundSynapseTransmission, OutboundSynapseTransmissionKind};
+use crate::{exec, netting::{OutboundSynapseTransmission, OutboundSynapseTransmissionKind}};
 
 use super::{ClientId, NettingMessage};
 
 pub struct Inputs<W> {
     pub kill_rx: oneshot::Receiver<()>,
     pub onm_rx: Receiver<(NettingMessage<W>, Option<ClientId>)>,
+    pub death_tally: Arc<AtomicUsize>,
 }
 
 pub struct Outputs {
@@ -29,17 +30,12 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Parceler<W>
     }
 
     pub fn start(mut self) -> JoinHandle<()> {
-        tokio::spawn(async move {
+        exec::spawn_kill_reporting(self.inputs.death_tally, async move {
             let mut cached_unsent_osynts = VecDeque::with_capacity(5);
             loop {
-                match self.inputs.kill_rx.try_recv() {
-                    Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
-                        trc::info!("KILL net parceler");
-                        return;
-                    },
-                    Err(oneshot::error::TryRecvError::Empty) => {
-                        trc::info!("KILL NOT net-parceler");
-                    },
+                if exec::kill_requested(&mut self.inputs.kill_rx) {
+                    trc::info!("KILL net parceler");
+                    return;
                 }
 
                 let (msg, client_id) = tokio::select! {

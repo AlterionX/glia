@@ -2,7 +2,7 @@ mod connman;
 mod collater;
 mod parceler;
 
-use std::{fmt::Debug, net::SocketAddr};
+use std::{fmt::Debug, net::SocketAddr, sync::{atomic::AtomicUsize, Arc}};
 
 use chrono::Utc;
 use derivative::Derivative;
@@ -70,9 +70,12 @@ impl ClientId {
 
 /// Struct holding network connections
 pub struct Inputs<W> {
-    pub kill_rx: oneshot::Receiver<()>,
+    pub connman_kill_rx: oneshot::Receiver<()>,
+    pub collater_kill_rx: oneshot::Receiver<()>,
+    pub parceler_kill_rx: oneshot::Receiver<()>,
     pub onm_rx: Receiver<(NettingMessage<W>, Option<ClientId>)>,
     pub osynt_rx: Receiver<OutboundSynapseTransmission>,
+    pub death_tally: Arc<AtomicUsize>,
 }
 
 pub struct Outputs<W> {
@@ -95,33 +98,25 @@ pub struct NettingJoinHandles {
 impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Netting<W> {
     pub fn init(inputs: Inputs<W>, outputs: Outputs<W>) -> Self {
         let (iknown_tx, iknown_rx) = mpsc::channel(1024);
-        let (connman_kill_tx, connman_kill_rx) = oneshot::channel();
-        let (collater_kill_tx, collater_kill_rx) = oneshot::channel();
-        let (parceler_kill_tx, parceler_kill_rx) = oneshot::channel();
-
-        tokio::spawn(async move {
-            trc::info!("KILL net");
-            inputs.kill_rx.await.ok();
-            connman_kill_tx.send(()).ok();
-            collater_kill_tx.send(()).ok();
-            parceler_kill_tx.send(()).ok();
-        });
 
         let collater = collater::Collater::init(collater::Inputs {
-            kill_rx: collater_kill_rx,
+            kill_rx: inputs.collater_kill_rx,
             iknown_rx,
+            death_tally: Arc::clone(&inputs.death_tally),
         }, collater::Outputs {
             inm_tx: outputs.inm_tx.clone(),
         });
         let parceler = parceler::Parceler::init(parceler::Inputs {
-            kill_rx: parceler_kill_rx,
+            kill_rx: inputs.parceler_kill_rx,
             onm_rx: inputs.onm_rx,
+            death_tally: Arc::clone(&inputs.death_tally),
         }, parceler::Outputs {
             osynt_tx: outputs.osynt_tx.clone(),
         });
         let connman = connman::ConnectionManager::init(connman::Inputs {
-            kill_rx: connman_kill_rx,
+            kill_rx: inputs.connman_kill_rx,
             osynt_rx: inputs.osynt_rx,
+            death_tally: Arc::clone(&inputs.death_tally),
         }, connman::Outputs::init(
             outputs.osynt_tx,
             iknown_tx,
