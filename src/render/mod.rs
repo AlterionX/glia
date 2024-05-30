@@ -1,17 +1,25 @@
-use std::sync::Arc;
+use std::sync::{atomic::AtomicUsize, Arc};
 
-use tokio::{task::JoinHandle, sync::mpsc::Receiver};
+use tokio::{sync::{mpsc::Receiver, oneshot}, task::JoinHandle};
 use winit::window::Window;
 
-use self::renderer::{Renderer, RendererPreferences};
+use crate::exec;
 
-pub mod task;
-mod renderer;
-mod shaders;
+// use self::renderer::{Renderer, RendererPreferences};
+
+// pub mod task;
+// mod renderer;
+// mod shaders;
+
+pub enum RenderScene {
+    Sim,
+    Menu,
+    MainMenu,
+}
 
 pub struct Render {
-    renderer: Renderer,
-    render_task_rx: Receiver<()>,
+    inputs: Inputs,
+    outputs: Outputs,
 }
 
 pub struct RenderingTaskHandle {
@@ -19,38 +27,77 @@ pub struct RenderingTaskHandle {
 }
 
 pub struct Inputs {
-    window: Arc<Window>,
-    render_task_rx: Receiver<()>,
+    pub window_rx: Receiver<Arc<Window>>,
+    pub trigger_render_rx: Receiver<RenderScene>,
+    pub kill_rx: oneshot::Receiver<()>,
 }
 
 pub struct Outputs {
+    pub death_tally: Arc<AtomicUsize>,
 }
 
 impl Render {
-    pub fn init(inputs: Inputs, _outputs: Outputs) -> Self {
-        let preferences = RendererPreferences::default();
-        let renderer = Renderer::init(Some("totality-render-demo".to_owned()), None, inputs.window, &preferences).expect("renderer to load");
-
+    pub fn init(inputs: Inputs, outputs: Outputs) -> Self {
         Self {
-            renderer,
-            render_task_rx: inputs.render_task_rx,
+            inputs,
+            outputs,
         }
     }
 
     pub fn start(mut self) -> RenderingTaskHandle {
-        let handle = tokio::spawn(async move { loop {
-            let initial = {
-                // Skip over non-recent render requests to get the most recent.
-                let mut initial = self.render_task_rx.recv().await.expect("render task value to be present");
-                while let Some(next_initial) = self.render_task_rx.try_recv().ok() {
-                    initial = next_initial;
-                }
-                initial
-            };
+        let handle = exec::spawn_kill_reporting(self.outputs.death_tally, async move {
+            // let _preferences = RendererPreferences::default();
 
-            // TODO Actually handle the responses.
-        }});
+            loop {
+                if exec::kill_requested(&mut self.inputs.kill_rx) {
+                    trc::info!("KILL render");
+                    return;
+                }
+
+                // let renderer = Renderer::init(Some("totality-render-demo".to_owned()), None, inputs.window_rx, &preferences).expect("renderer to load");
+
+                loop {
+                    if exec::kill_requested(&mut self.inputs.kill_rx) {
+                        trc::info!("KILL render");
+                        return;
+                    }
+
+                    // Skip over non-recent render requests to get the most recent.
+                    let mut initial = self.inputs.trigger_render_rx.recv().await.expect("render task value to be present");
+                    while let Some(next_initial) = self.inputs.trigger_render_rx.try_recv().ok() {
+                        initial = next_initial;
+                    }
+                    // TODO Actually handle the responses.
+
+                    let draw_call = match initial {
+                        RenderScene::Sim => {
+                            determine_sim_draw_calls()
+                        },
+                        RenderScene::Menu => {
+                            determine_menu_draw_calls()
+                        },
+                        RenderScene::MainMenu => {
+                            determine_main_menu_draw_calls()
+                        },
+                    };
+
+                    // renderer.draw(draw_call);
+                }
+            }
+        });
 
         RenderingTaskHandle { handle }
     }
+}
+
+fn determine_sim_draw_calls() -> Vec<()> {
+    todo!("menu not implemented");
+}
+
+fn determine_menu_draw_calls() -> Vec<()> {
+    todo!("menu not implemented");
+}
+
+fn determine_main_menu_draw_calls() -> Vec<()> {
+    todo!("main menu not implemented");
 }

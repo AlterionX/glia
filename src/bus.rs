@@ -1,9 +1,9 @@
 use std::{collections::{hash_map, HashMap}, fmt::Debug, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use tokio::{task::JoinHandle, sync::{mpsc::{Sender, Receiver}, oneshot}};
 
-use crate::{exec, netting::{ClientId, InboundNettingMessage, NettingApi, NettingMessageKind}, simulation::{SnapshotWorldState, SynchronizedSimulatable}};
+use crate::{exec::{self, ReceiverTimeoutExt}, netting::{ClientId, InboundNettingMessage, NettingApi, NettingMessageKind}, simulation::{SnapshotWorldState, SynchronizedSimulatable}};
 
 pub struct Inputs<W> {
     pub sim_running: Arc<AtomicBool>,
@@ -45,12 +45,8 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clo
                     return;
                 }
 
-                let inbound_msg = tokio::select! {
-                    m = self.inputs.inm_rx.recv() => match m {
-                        Some(f) => f,
-                        None => { continue; },
-                    },
-                    _ = tokio::time::sleep(chrono::Duration::milliseconds(100).to_std().unwrap()) => { continue; },
+                let Some(inbound_msg) = self.inputs.inm_rx.recv_for_ms(100).await.value() else {
+                    continue;
                 };
                 let msg = inbound_msg.msg;
                 let span = trc::span!(trc::Level::TRACE, "NM-MSG", id = msg.message_id);

@@ -2,7 +2,7 @@ use std::{collections::VecDeque, fmt::Debug, sync::{atomic::AtomicUsize, Arc}};
 
 use tokio::{sync::{mpsc::{Receiver, Sender}, oneshot}, task::JoinHandle};
 
-use crate::{exec, netting::{OutboundSynapseTransmission, OutboundSynapseTransmissionKind}};
+use crate::{exec::{self, ReceiverTimeoutExt}, netting::{OutboundSynapseTransmission, OutboundSynapseTransmissionKind}};
 
 use super::{ClientId, NettingMessage};
 
@@ -38,12 +38,8 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Parceler<W>
                     return;
                 }
 
-                let (msg, client_id) = tokio::select! {
-                    m = self.inputs.onm_rx.recv() => match m {
-                        Some(f) => f,
-                        None => { continue; },
-                    },
-                    _ = tokio::time::sleep(chrono::Duration::milliseconds(100).to_std().unwrap()) => { continue; },
+                let Some((msg, client_id)) = self.inputs.onm_rx.recv_for_ms(100).await.value() else {
+                    continue;
                 };
                 trc::info!("NET-ONM Sending {msg:?}");
                 // TODO Break apart into multiple osynts and shove through the network. Drop for

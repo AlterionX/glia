@@ -3,7 +3,7 @@ use std::{collections::{HashMap, VecDeque}, fmt::Debug, sync::{atomic::{AtomicBo
 use chrono::{DateTime, Utc};
 use tokio::{sync::{mpsc::Receiver, oneshot, RwLock}, task::JoinHandle};
 
-use crate::{exec, netting::{ClientId, NettingApi, NettingMessageKind}};
+use crate::{exec::{self, ReceiverTimeoutExt, TimeoutOutcome}, netting::{ClientId, NettingApi, NettingMessageKind}};
 
 // TODO use a triple buffer with some network-related niceties
 #[derive(Default)]
@@ -182,19 +182,15 @@ impl<
                 loop {
                     let now = Utc::now();
                     if now < target_sim_time {
-                        tokio::select! {
-                            opt_msg = self.force_jump_rx.recv() => match opt_msg {
-                                Some(Some((target_arrival_time, _target_generation))) => {
-                                    // This means we're hard resetting and need to reset counters.
-                                    trc::info!("SIM-RESET resetting catchup target to {target_arrival_time:?}");
-                                    target_sim_time = target_arrival_time + (now - target_arrival_time);
-                                },
-                                None | Some(None) => {
-                                    // This means we're still aiming for the same target generation --
-                                    // no changes other than cancelling the sleep is needed.
-                                },
+                        match self.force_jump_rx.recv_for(target_sim_time - now).await {
+                            TimeoutOutcome::Value(Some((target_arrival_time, _target_generation))) => {
+                                // This means we're hard resetting and need to reset counters.
+                                trc::info!("SIM-RESET resetting catchup target to {target_arrival_time:?}");
+                                target_sim_time = target_arrival_time + (now - target_arrival_time);
                             },
-                            _ = tokio::time::sleep((target_sim_time - now).to_std().unwrap()) => {},
+                            // This means we're still aiming for the same target generation --
+                            // no changes other than cancelling the sleep is needed.
+                            TimeoutOutcome::Value(None) | TimeoutOutcome::Closed | TimeoutOutcome::Timeout => {},
                         }
                     }
                     // It's okay to drop errors. If it's disconnected, something's probably

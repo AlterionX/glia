@@ -6,7 +6,7 @@ mod exec;
 // Underlying tech modules.
 mod netting;
 mod simulation;
-// mod render;
+mod render;
 mod input;
 mod system;
 mod bus;
@@ -14,11 +14,12 @@ mod bus;
 // Actual game modules.
 mod world;
 
-use std::{error::Error, fmt::{Display, Pointer}, net::IpAddr, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}};
+use std::{error::Error, fmt::Display, net::IpAddr, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}};
 
 use chrono::{DateTime, Duration, TimeDelta, Utc};
 
-use tokio::{io::{AsyncBufRead, AsyncBufReadExt, BufReader}, sync::{mpsc, oneshot}};
+use render::Render;
+use tokio::{io::{AsyncBufReadExt, BufReader}, sync::{mpsc, oneshot}};
 
 use crate::{bus::Bus, netting::{Netting, NettingApi, NettingMessageKind}, simulation::Simulation, system::SystemBus, world::World};
 
@@ -217,6 +218,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
     let sim_running = Arc::new(AtomicBool::new(false));
     // System/Render channels
     let (window_tx, window_rx) = mpsc::channel(10);
+    let (draw_call_tx, draw_call_rx) = mpsc::channel(10);
     let (net_connman_kill_tx, net_connman_kill_rx) = oneshot::channel();
     let (net_parceler_kill_tx, net_parceler_kill_rx) = oneshot::channel();
     let (net_collater_kill_tx, net_collater_kill_rx) = oneshot::channel();
@@ -224,6 +226,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
     let (bus_kill_tx, bus_kill_rx) = oneshot::channel();
     let (sys_kill_tx, sys_kill_rx) = oneshot::channel();
     let (tio_kill_tx, mut tio_kill_rx) = oneshot::channel();
+    let (renderer_kill_tx, renderer_kill_rx) = oneshot::channel();
     let death_tally = Arc::new(AtomicUsize::new(0));
 
     let net_api = NettingApi {
@@ -268,10 +271,13 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
     }, simulation::Outputs {
         running: Arc::clone(&sim_running),
     });
-    // let ren = Render::init(render::Inputs {
-    //     kill_rx: ren_kill_rx,
-    // }, render:::Outputs {
-    // });
+    let ren = Render::init(render::Inputs {
+        window_rx,
+        trigger_render_rx: draw_call_rx,
+        kill_rx: renderer_kill_rx,
+    }, render::Outputs {
+        death_tally: Arc::clone(&death_tally),
+    });
     let sys = SystemBus::init(system::Inputs {
         kill_rx: sys_kill_rx,
         death_tally: Arc::clone(&death_tally),
@@ -281,6 +287,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
             ("net-collater", net_collater_kill_tx),
             ("net-connman", net_connman_kill_tx),
             ("net-parceler", net_parceler_kill_tx),
+            ("renderer", renderer_kill_tx),
             ("sim", sim_kill_tx),
             ("bus", bus_kill_tx),
             ("sys", sys_kill_tx),
@@ -357,9 +364,10 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
         }
     });
 
-    let net_handle = net.start();
-    let bus_handle = bus.start();
-    let sim_handle = sim.start();
+    let _net_handle = net.start();
+    let _bus_handle = bus.start();
+    let _sim_handle = sim.start();
+    let _ren_handle = ren.start();
     sys.takeover_thread().map_err(|_| {
         ReportableError { message: "system ended abnormally".to_owned() }
     })

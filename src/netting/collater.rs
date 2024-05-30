@@ -2,7 +2,7 @@ use std::{collections::{HashMap, VecDeque}, fmt::Debug, sync::{atomic::AtomicUsi
 
 use tokio::{sync::{mpsc::{Receiver, Sender}, oneshot}, task::JoinHandle};
 
-use crate::{exec, netting::{NettingMessage, NettingMessageParseError}};
+use crate::{exec::{self, ReceiverTimeoutExt}, netting::{NettingMessage, NettingMessageParseError}};
 
 use super::{AttributedInboundBytes, InboundNettingMessage, NettingMessageBytesWithOrdering};
 
@@ -40,15 +40,10 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Collater<W>
                     return;
                 }
 
-                let known_msg = tokio::select! {
-                    m = self.inputs.iknown_rx.recv() => match m {
-                        Some(f) => f,
-                        None => { continue; },
-                    },
-                    _ = tokio::time::sleep(chrono::Duration::milliseconds(100).to_std().unwrap()) => { continue; },
+                let Some(known_msg) = self.inputs.iknown_rx.recv_for_ms(100).await.value() else {
+                    continue;
                 };
                 trc::debug!("NET-IKNOWN-PARSE {:?}", known_msg.decrypted_bytes);
-                trc::info!("WTFFFFFFF");
                 let opt_msg = match NettingMessage::parse(known_msg.decrypted_bytes) {
                     Ok(msg) => Some(msg),
                     Err(NettingMessageParseError::PartialMessage {
