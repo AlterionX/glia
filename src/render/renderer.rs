@@ -2,12 +2,12 @@ use std::{collections::{hash_map::Entry, HashMap}, sync::Arc, time::{Duration, I
 
 use img::ImageFormat;
 use raw_window_handle::HandleError;
-use tap::{TapFallible, TapOptional};
+use tap::TapFallible;
 use thiserror::Error;
 
 use vulkano::{
     buffer::{
-        AllocateBufferError, Buffer, BufferCreateInfo, BufferUsage, IndexBuffer, Subbuffer
+        AllocateBufferError, Buffer, BufferContents, BufferCreateInfo, BufferUsage, IndexBuffer, Subbuffer
     }, command_buffer::{
         allocator::{
             CommandBufferAllocator, StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo
@@ -23,16 +23,16 @@ use vulkano::{
     }, device::{
         physical::{
             PhysicalDevice, PhysicalDeviceType
-        }, Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags
+        }, Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, DeviceProperties, Queue, QueueCreateInfo, QueueFlags
     }, format::{
         ClearValue, Format
     }, image::{
-        sampler::{Sampler, SamplerCreateInfo}, view::ImageView, Image, ImageCreateInfo, ImageLayout, ImageTiling, ImageType, ImageUsage, SampleCount
+        sampler::{Sampler, SamplerCreateInfo}, view::{ImageView, ImageViewCreateInfo}, Image, ImageCreateInfo, ImageLayout, ImageTiling, ImageType, ImageUsage, SampleCount
     }, instance::{
         Instance,
         InstanceCreateInfo,
     }, memory::allocator::{
-        AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator
+        AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator
     }, pipeline::{
         graphics::{
             color_blend::{
@@ -43,15 +43,26 @@ use vulkano::{
                 InputAssemblyState,
                 PrimitiveTopology,
             }, multisample::MultisampleState, rasterization::{
-                CullMode, RasterizationState
+                CullMode,
+                RasterizationState,
             }, subpass::PipelineSubpassType, vertex_input::{
-                VertexInputAttributeDescription, VertexInputBindingDescription, VertexInputRate, VertexInputState
+                VertexInputAttributeDescription,
+                VertexInputBindingDescription,
+                VertexInputRate,
+                VertexInputState,
             }, viewport::{
-                Scissor, Viewport, ViewportState
+                Scissor,
+                Viewport,
+                ViewportState,
             }, GraphicsPipelineCreateInfo
         }, layout::{
             PipelineLayoutCreateFlags, PipelineLayoutCreateInfo, PushConstantRange
-        }, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo
+        },
+        Pipeline,
+        GraphicsPipeline,
+        PipelineBindPoint,
+        PipelineLayout,
+        PipelineShaderStageCreateInfo,
     }, render_pass::{
         Framebuffer, RenderPass, Subpass
     }, shader::{
@@ -67,37 +78,62 @@ use winit::{window::{WindowId, Window}, dpi::PhysicalSize};
 
 use crate::render::{task::RenderTask, shaders};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct RendererPreferences {
+    pub preferred_physical_device: Option<String>,
+    pub preferred_physical_device_type: Option<PhysicalDeviceType>,
+    pub application_name: Option<String>,
+    pub application_version: Option<Version>,
+}
+
+impl RendererPreferences {
+    fn split(self) -> (LibraryPreferences, DevicePreferences) {
+        (LibraryPreferences {
+            application_name: self.application_name,
+            application_version: self.application_version,
+        }, DevicePreferences {
+            preferred_physical_device: self.preferred_physical_device,
+            preferred_physical_device_type: self.preferred_physical_device_type,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct LibraryPreferences {
+    pub application_name: Option<String>,
+    pub application_version: Option<Version>,
+}
+
+#[derive(Debug, Default)]
+pub struct DevicePreferences {
     pub preferred_physical_device: Option<String>,
     pub preferred_physical_device_type: Option<PhysicalDeviceType>,
 }
 
-impl RendererPreferences {
+impl DevicePreferences {
+    /// For convenience preferred device check.
+    fn is_preferred_device(&self, properties: &DeviceProperties) -> bool {
+        let Some(ref preferred) = self.preferred_physical_device_type else {
+            return false;
+        };
+        *preferred == properties.device_type
+    }
+
+    /// For convenience preferred name check.
+    fn is_preferred_name(&self, properties: &DeviceProperties) -> bool {
+        let Some(ref preferred) = self.preferred_physical_device else {
+            return false;
+        };
+        *preferred == properties.device_name
+    }
+
     // This is a "generally better" heuristic. (Higher is better.)
     fn score_physical_device(&self, physical_device: &PhysicalDevice) -> usize {
         let props = physical_device.properties();
 
-        let name_score = if let Some(ref name) = self.preferred_physical_device {
-            if props.device_name == *name {
-                1
-            } else {
-                0
-            }
-        } else {
-            0
-        };
+        let name_score = if self.is_preferred_name(&props) { 1 } else { 0 };
 
-        const PDT_PREF_SCALING: usize = 2;
-        let pdt_pref_score = if let Some(ref pdt) = self.preferred_physical_device_type {
-            if props.device_type == *pdt {
-                1
-            } else {
-                0
-            }
-        } else {
-            0
-        };
+        let pdt_pref_score = if self.is_preferred_device(&props) { 1 } else { 0 };
 
         // We'll just use an array here -- a match doesn't really help.
         // Ordered from least preferred to most. Later entries have higher indices so they're more
@@ -110,18 +146,14 @@ impl RendererPreferences {
             PhysicalDeviceType::IntegratedGpu,
             PhysicalDeviceType::DiscreteGpu,
         ];
-        let pdt_ord_score = 'a: {
-            for (idx, pdt) in PDT_ORD_ARR.iter().enumerate() {
-                if *pdt == props.device_type {
-                    // Add one to offset away from the zero value, which represents "I couldn't
-                    // find it"
-                    break 'a idx + 1;
-                }
-            }
-            0
-        };
+        let pdt_ord_score = PDT_ORD_ARR.iter().position(|&pdt| pdt == props.device_type).unwrap_or(0);
 
-        ((name_score << 1) + pdt_pref_score) * (PDT_ORD_ARR.len() + 1) + pdt_ord_score
+        // This is the score without knowledge of the device. If we have a target name, that
+        // overrides any device "attributes".
+        let primary_score = (name_score << 1) + pdt_pref_score;
+        // We'll scale this up by a flat factor so that we can add a discriminant to prefer
+        // discrete GPUs.
+        primary_score * (PDT_ORD_ARR.len() + 1) + pdt_ord_score
     }
 }
 
@@ -221,54 +253,29 @@ impl RenderTimer {
     }
 }
 
-pub struct Renderer {
-    vulkan: Arc<Instance>,
-
-    vertex_shader: Arc<ShaderModule>,
-    geometry_shader: Arc<ShaderModule>,
-    fragment_shader: Arc<ShaderModule>,
-
-    ordered_physical_devices: Vec<Arc<PhysicalDevice>>,
-    selected_physical_device_idx: usize,
-    selected_device: Arc<Device>,
-    selected_device_queues: Vec<Arc<Queue>>,
-
-    device_memory_alloc: Arc<StandardMemoryAllocator>,
-
-    vertex_buffer: Subbuffer<[u8]>,
-    face_buffer: Subbuffer<[u8]>,
-    uniform_counts_buffer: Subbuffer<[u8]>,
-    uniform_per_mesh_buffer: Subbuffer<[u8]>,
-    uniform_light_buffer: Subbuffer<[u8]>,
-    uniform_material_buffer: Subbuffer<[u8]>,
-    constants_buffer: Subbuffer<[u8]>,
-    staging_texture_buffer: Subbuffer<[u8]>,
-
-    command_buffer_alloc: Arc<dyn CommandBufferAllocator>,
-
-    pipeline_layout: Arc<PipelineLayout>,
-
-    descriptor_set_layout: Arc<DescriptorSetLayout>,
-    texture_descriptor_set_layout: Arc<DescriptorSetLayout>,
-    descriptor_pool: DescriptorPool,
-    descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
-    descriptor_set: Arc<DescriptorSet>,
-    empty_texture_descriptor_set: Arc<DescriptorSet>,
-    texture_sampler: Arc<Sampler>,
-
-    // TODO: better map for window ids?
-    windowed_swapchain: HashMap<WindowId, RendererWindowSwapchain>,
-
-    // Mesh id to (vertex, index) buffer offsets.
-    loaded_models: HashMap<u64, LoadedModelHandles>,
-    vertex_free_byte_start: u64,
-    index_free_byte_start: u64,
-    vertex_free_start: i32,
-    index_free_start: u32,
+pub struct QueueBookmarks {
+    family_idx: u32,
 }
 
-impl Renderer {
-    pub fn init(application_name: Option<String>, application_version: Option<Version>, windowing: Arc<Window>, pref: &RendererPreferences) -> Result<Self, RendererInitializationError> {
+pub struct ShaderBlock {
+    vertex: Arc<ShaderModule>,
+    geometry: Arc<ShaderModule>,
+    fragment: Arc<ShaderModule>,
+}
+
+pub struct RendererDescriptorLayouts {
+    general: Arc<DescriptorSetLayout>,
+    texture: Arc<DescriptorSetLayout>,
+}
+
+pub struct RendererBuilder {
+    pub windowing: Arc<Window>,
+    pub prefs: RendererPreferences,
+}
+
+/// Initialization helpers.
+impl RendererBuilder {
+    fn initialize_vulkan(windowing: Arc<Window>, prefs: LibraryPreferences) -> Result<Arc<Instance>, RendererInitializationError> {
         let vulkan_library = VulkanLibrary::new()
             .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED primary_source=vulkan_lib error=missing_error {e}"))?;
         let required_extensions = Surface::required_extensions(&windowing)
@@ -279,8 +286,8 @@ impl Renderer {
                 enabled_extensions: required_extensions,
                 engine_name: Some("totality".to_owned()),
                 engine_version: Version::default(),
-                application_name,
-                application_version: application_version.unwrap_or_default(),
+                application_name: prefs.application_name,
+                application_version: prefs.application_version.unwrap_or_default(),
                 // enabled_layers: vec!["VK_LAYER_KHRONOS_validation".to_owned(), "VK_LAYER_LUNARG_api_dump".to_owned()],
                 ..Default::default()
             }
@@ -288,77 +295,85 @@ impl Renderer {
             .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=driver error=instance {e}"))
             .map_err(RendererInitializationError::Instance)?;
 
-        // Find best (most performant or preferred) valid device.
-        let ordered_physical_devices = {
-            let iter = vulkan.enumerate_physical_devices()
-                .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=physical_devices error=enumeration_failure {e}"))
-                .map_err(RendererInitializationError::Physical)?;
-            let minimum_device_extensions = DeviceExtensions {
-                khr_swapchain: true,
-                ..DeviceExtensions::empty()
-            };
-            let mut devices = iter.filter(|pd| pd.supported_extensions().contains(&minimum_device_extensions)).collect::<Vec<_>>();
-            devices.sort_by_cached_key(|pd| pref.score_physical_device(pd));
-            devices
+        Ok(vulkan)
+    }
+
+    /// Find best (most performant or preferred) valid device.
+    fn select_physical_device(vulkan: &Arc<Instance>, prefs: DevicePreferences) -> Result<Arc<PhysicalDevice>, RendererInitializationError> {
+        let iter = vulkan.enumerate_physical_devices()
+            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=physical_devices error=enumeration_failure {e}"))
+            .map_err(RendererInitializationError::Physical)?;
+        let minimum_device_extensions = DeviceExtensions {
+            khr_swapchain: true,
+            ..DeviceExtensions::empty()
+        };
+        let mut devices = iter.filter(|pd| pd.supported_extensions().contains(&minimum_device_extensions)).collect::<Vec<_>>();
+        // Sort from least score to most score since that puts the highest value device at the end
+        // to make it easier to remove.
+        devices.sort_by_cached_key(|pd| prefs.score_physical_device(pd));
+        let Some(device) = devices.pop() else {
+            trc::error!("TOTALITY-RENDERER-INIT-FAILED source=physical_devices error=no_device");
+            return Err(RendererInitializationError::NoPhysicalDevice);
         };
 
-        // We need something that can *actually* render something.
-        let (selected_physical_device_idx, selected_queue_family_idx) = 'queue_family: {
-            // Assume there's at least one physical device and that the first device is valid.
-            let physical = ordered_physical_devices.first()
-                .tap_none(|| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=physical_devices error=no_device"))
-                .ok_or_else(|| RendererInitializationError::NoPhysicalDevice)?;
-            let queue_props = physical.queue_family_properties();
-            // Just pick the first valid one for now, we'll come back.
-            // TODO Be smarter about selecting a queue family, or be dynamic about it.
-            // TODO disqualify queues that don't support a surface
-            for (idx, family) in queue_props.iter().enumerate() {
-                if family.queue_flags.contains(QueueFlags::GRAPHICS) {
-                    let idx_u32 = idx.try_into().expect("number of queues is small enough to fit into a u32");
-                    break 'queue_family (0, idx_u32);
-                }
-            }
+        Ok(device)
+    }
+
+    /// Select a queue family. We need something that can *actually* render something.
+    fn select_queue_family(physical: &Arc<PhysicalDevice>) -> Result<QueueBookmarks, RendererInitializationError> {
+        // Assume there's at least one physical device and that the first device is valid.
+        let queue_props = physical.queue_family_properties();
+        // Just pick the first valid one for now, we'll come back.
+        // TODO Be smarter about selecting a queue family, or be dynamic about it.
+        // TODO disqualify queues that don't support a surface
+        let Some(idx) = queue_props.iter().position(|family| family.queue_flags.contains(QueueFlags::GRAPHICS)) else {
             return Err(RendererInitializationError::PhysicalDeviceMissingGraphicsCapabilities);
         };
 
-        let (selected_device, selected_device_queues) = {
-            let required_extensions = DeviceExtensions {
-                khr_swapchain: true,
-                khr_push_descriptor: true,
-                ..DeviceExtensions::empty()
-            };
-            let (device, queues_iter) = Device::new(
-                Arc::clone(&ordered_physical_devices[0]),
-                DeviceCreateInfo {
-                    enabled_features: DeviceFeatures {
-                        geometry_shader: true,
-                        ..DeviceFeatures::empty()
-                    },
-                    queue_create_infos: vec![QueueCreateInfo {
-                        queue_family_index: selected_queue_family_idx,
-                        ..Default::default()
-                    }],
-                    enabled_extensions: required_extensions,
-                    ..Default::default()
-                },
-            )
-                .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=device_queue error=failed_creation {e}"))
-                .map_err(RendererInitializationError::QueueCreationFailed)?;
-            let queues: Vec<_> = queues_iter.collect();
-            if queues.is_empty() {
-                return Err(RendererInitializationError::NoCommandQueue);
-            }
-            (device, queues)
+        let Ok(idx_u32) = idx.try_into() else {
+            panic!("number of queues is small enough to fit into a u32")
         };
 
-        // TODO Reevaluate if we can adjust the memory allocator.
-        let device_memory_alloc = Arc::new(StandardMemoryAllocator::new_default(Arc::clone(&selected_device)));
-        // TODO Can we get rid of this?
-        let dyn_device_memory_alloc = Arc::clone(&device_memory_alloc) as _;
+        Ok(QueueBookmarks { family_idx: idx_u32 })
+    }
 
-        // Let's just allocate a giant chunk for vertices.
-        let vertex_buffer = Buffer::new_unsized(
-            Arc::clone(&dyn_device_memory_alloc),
+    fn create_logical_device(physical: Arc<PhysicalDevice>, queue_bookmarks: &QueueBookmarks) -> Result<(Arc<Device>, Arc<Queue>), RendererInitializationError> {
+        let required_extensions = DeviceExtensions {
+            khr_swapchain: true,
+            ..DeviceExtensions::empty()
+        };
+        let device_result = Device::new(
+            physical,
+            DeviceCreateInfo {
+                enabled_features: DeviceFeatures {
+                    geometry_shader: true,
+                    ..DeviceFeatures::empty()
+                },
+                queue_create_infos: vec![QueueCreateInfo {
+                    queue_family_index: queue_bookmarks.family_idx,
+                    ..Default::default()
+                }],
+                enabled_extensions: required_extensions,
+                ..Default::default()
+            },
+        );
+        let (device, mut queues_iter) = match device_result {
+            Ok(device) => device,
+            Err(e) => {
+                trc::error!("TOTALITY-RENDERER-INIT-FAILED source=device_queue error=failed_creation {e}");
+                return Err(RendererInitializationError::QueueCreationFailed(e));
+            },
+        };
+        let Some(queue) = queues_iter.next() else {
+            return Err(RendererInitializationError::NoCommandQueue);
+        };
+
+        Ok((device, queue))
+    }
+
+    fn allocate_vertex_buffer<T: BufferContents + ?Sized>(device_memory_alloc: Arc<dyn MemoryAllocator>) -> Result<Subbuffer<T>, RendererInitializationError> {
+        let result = Buffer::new_unsized(
+            device_memory_alloc,
             BufferCreateInfo {
                 usage: BufferUsage::VERTEX_BUFFER | BufferUsage::TRANSFER_DST,
                 // flags: BufferCreateFlags::default(),
@@ -378,13 +393,21 @@ impl Renderer {
             // Let's just assume each scene will have < 5_000_000 vertices. So let's just allocate
             // 60 MB. Then add an extra vector.
             60 * 1024 * 1024
-        )
-            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=vertex_buffer error=failed_creation {e}"))
-            .map_err(RendererInitializationError::BufferCreationFailed)?
-        ;
-        // And then for triangles.
-        let face_buffer = Buffer::new_unsized(
-            Arc::clone(&dyn_device_memory_alloc),
+        );
+        let buffer = match result {
+            Ok(b) => b,
+            Err(e) => {
+                trc::error!("TOTALITY-RENDERER-INIT-FAILED source=vertex_buffer error=failed_creation {e}");
+                return Err(RendererInitializationError::BufferCreationFailed(e));
+            },
+        };
+
+        Ok(buffer)
+    }
+
+    fn allocate_face_buffer<T: BufferContents + ?Sized>(device_memory_alloc: Arc<dyn MemoryAllocator>) -> Result<Subbuffer<T>, RendererInitializationError> {
+        let result = Buffer::new_unsized(
+            device_memory_alloc,
             BufferCreateInfo {
                 usage: BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
                 // flags: BufferCreateFlags::default(),
@@ -404,12 +427,21 @@ impl Renderer {
             // Let's just assume each scene will have < 5_000_000 faces. So let's just allocate
             // 60 MB. Then add an extra vector.
             60 * 1024 * 1024
-        )
-            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=face_buffer error=failed_creation {e}"))
-            .map_err(RendererInitializationError::BufferCreationFailed)?;
-        // One for instanced model sets.
-        let uniform_counts_buffer = Buffer::new_unsized(
-            Arc::clone(&dyn_device_memory_alloc),
+        );
+        let buffer = match result {
+            Ok(b) => b,
+            Err(e) => {
+                trc::error!("TOTALITY-RENDERER-INIT-FAILED source=face_buffer error=failed_creation {e}");
+                return Err(RendererInitializationError::BufferCreationFailed(e))?;
+            },
+        };
+
+        Ok(buffer)
+    }
+
+    fn allocate_count_buffer<T: BufferContents + ?Sized>(device_memory_alloc: Arc<dyn MemoryAllocator>) -> Result<Subbuffer<T>, RendererInitializationError> {
+        let result = Buffer::new_unsized(
+            device_memory_alloc,
             BufferCreateInfo {
                 usage: BufferUsage::UNIFORM_BUFFER | BufferUsage::TRANSFER_DST,
                 // flags: (),
@@ -427,12 +459,20 @@ impl Renderer {
             // This allows for approximately 1024 instances.
             // Assuming a 4x4 32bit ...
             16,
-        )
-            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=count_buffer error=failed_creation {e}"))
-            .map_err(RendererInitializationError::BufferCreationFailed)?;
-        // One for instanced model sets.
-        let uniform_per_mesh_buffer = Buffer::new_unsized(
-            Arc::clone(&dyn_device_memory_alloc),
+        );
+        let buffer = match result {
+            Ok(b) => b,
+            Err(e) => {
+                trc::error!("TOTALITY-RENDERER-INIT-FAILED source=count_buffer error=failed_creation {e}");
+                return Err(RendererInitializationError::BufferCreationFailed(e));
+            },
+        };
+        Ok(buffer)
+    }
+
+    fn allocate_mesh_uniform_buffer<T: BufferContents + ?Sized>(device_memory_alloc: Arc<dyn MemoryAllocator>) -> Result<Subbuffer<T>, RendererInitializationError> {
+        let result = Buffer::new_unsized(
+            device_memory_alloc,
             BufferCreateInfo {
                 usage: BufferUsage::UNIFORM_BUFFER | BufferUsage::TRANSFER_DST,
                 // flags: (),
@@ -450,12 +490,20 @@ impl Renderer {
             // This allows for approximately 1024 instances.
             // Assuming a 4x4 32bit ...
             64 * 1024,
-        )
-            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=matrix_buffer error=failed_creation {e}"))
-            .map_err(RendererInitializationError::BufferCreationFailed)?;
-        // A light buffer...
-        let uniform_light_buffer = Buffer::new_unsized(
-            Arc::clone(&dyn_device_memory_alloc),
+        );
+        let buffer = match result {
+            Ok(b) => b,
+            Err(e) => {
+                trc::error!("TOTALITY-RENDERER-INIT-FAILED source=matrix_buffer error=failed_creation {e}");
+                return Err(RendererInitializationError::BufferCreationFailed(e));
+            },
+        };
+        Ok(buffer)
+    }
+
+    fn allocate_light_buffer<T: BufferContents + ?Sized>(device_memory_alloc: Arc<dyn MemoryAllocator>) -> Result<Subbuffer<T>, RendererInitializationError> {
+        let result = Buffer::new_unsized(
+            device_memory_alloc,
             BufferCreateInfo {
                 usage: BufferUsage::UNIFORM_BUFFER | BufferUsage::TRANSFER_DST,
                 // flags: (),
@@ -474,12 +522,20 @@ impl Renderer {
             // Assuming a 4x4 32bit float matrix for orientation, positioning, and scaling -- 16 *
             // 32 / 8 = 2^6 bytes per array. 2^6 * 500 = 32000. Let's just use ~50KB.
             96 * 1024,
-        )
-            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=matrix_buffer error=failed_creation {e}"))
-            .map_err(RendererInitializationError::BufferCreationFailed)?;
-        // More for materials!
-        let uniform_material_buffer = Buffer::new_unsized(
-            Arc::clone(&dyn_device_memory_alloc),
+        );
+        let buffer = match result {
+            Ok(b) => b,
+            Err(e) => {
+                trc::error!("TOTALITY-RENDERER-INIT-FAILED source=light_buffer error=failed_creation {e}");
+                return Err(RendererInitializationError::BufferCreationFailed(e));
+            },
+        };
+        Ok(buffer)
+    }
+
+    fn allocate_material_buffer<T: BufferContents + ?Sized>(device_memory_alloc: Arc<dyn MemoryAllocator>) -> Result<Subbuffer<T>, RendererInitializationError> {
+        let result = Buffer::new_unsized(
+            device_memory_alloc,
             BufferCreateInfo {
                 usage: BufferUsage::UNIFORM_BUFFER | BufferUsage::TRANSFER_DST,
                 // flags: (),
@@ -498,12 +554,20 @@ impl Renderer {
             // Assuming a 4x4 32bit float matrix for orientation, positioning, and scaling -- 16 *
             // 32 / 8 = 2^6 bytes per array. 2^6 * 500 = 32000. Let's just use ~50KB.
             16 * 1024,
-        )
-            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=matrix_buffer error=failed_creation {e}"))
-            .map_err(RendererInitializationError::BufferCreationFailed)?;
-        // And another for textures.
-        let staging_texture_buffer = Buffer::new_unsized(
-            Arc::clone(&dyn_device_memory_alloc),
+        );
+        let buffer = match result {
+            Ok(b) => b,
+            Err(e) => {
+                trc::error!("TOTALITY-RENDERER-INIT-FAILED source=material_buffer error=failed_creation {e}");
+                return Err(RendererInitializationError::BufferCreationFailed(e))
+            },
+        };
+        Ok(buffer)
+    }
+
+    fn allocate_texture_staging_buffer<T: BufferContents + ?Sized>(device_memory_alloc: Arc<dyn MemoryAllocator>) -> Result<Subbuffer<T>, RendererInitializationError> {
+        let result = Buffer::new_unsized(
+            device_memory_alloc,
             BufferCreateInfo {
                 usage: BufferUsage::UNIFORM_TEXEL_BUFFER | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
                 // flags: (),
@@ -520,12 +584,78 @@ impl Renderer {
                 ..Default::default()
             },
             50 * 1024 * 1024
-        )
-            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=staging_texture_buffer error=failed_creation {e}"))
-            .map_err(RendererInitializationError::BufferCreationFailed)?;
-        // And a last chunk for constants.
-        let constants_buffer = Buffer::new_unsized(
-            Arc::clone(&dyn_device_memory_alloc),
+        );
+        let buffer = match result {
+            Ok(b) => b,
+            Err(e) => {
+                trc::error!("TOTALITY-RENDERER-INIT-FAILED source=staging_texture_buffer error=failed_creation {e}");
+                return Err(RendererInitializationError::BufferCreationFailed(e))
+            },
+        };
+        Ok(buffer)
+    }
+
+    fn allocate_wireframe_buffer<T: BufferContents + ?Sized>(device_memory_alloc: Arc<dyn MemoryAllocator>) -> Result<Subbuffer<T>, RendererInitializationError> {
+        let results = Buffer::new_unsized(
+            device_memory_alloc,
+            BufferCreateInfo {
+                usage: BufferUsage::UNIFORM_BUFFER | BufferUsage::TRANSFER_DST,
+                // flags: (),
+                // sharing: (),
+                // size: (),
+                // external_memory_handle_types: (),
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                // memory_type_bits: (),
+                // allocate_preference: (),
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            16
+        );
+        let buffer = match results {
+            Ok(b) => b,
+            Err(e) => {
+                trc::error!("TOTALITY-RENDERER-INIT-FAILED source=wireframe_buffer error=failed_creation {e}");
+                return Err(RendererInitializationError::BufferCreationFailed(e));
+            },
+        };
+        Ok(buffer)
+    }
+
+    fn allocate_cam_matrix_buffer<T: BufferContents + ?Sized>(device_memory_alloc: Arc<dyn MemoryAllocator>) -> Result<Subbuffer<T>, RendererInitializationError> {
+        let results = Buffer::new_unsized(
+            device_memory_alloc,
+            BufferCreateInfo {
+                usage: BufferUsage::UNIFORM_BUFFER | BufferUsage::TRANSFER_DST,
+                // flags: (),
+                // sharing: (),
+                // size: (),
+                // external_memory_handle_types: (),
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                // memory_type_bits: (),
+                // allocate_preference: (),
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            64
+        );
+        let buffer = match results {
+            Ok(b) => b,
+            Err(e) => {
+                trc::error!("TOTALITY-RENDERER-INIT-FAILED source=cam_matrix_buffer error=failed_creation {e}");
+                return Err(RendererInitializationError::BufferCreationFailed(e));
+            },
+        };
+        Ok(buffer)
+    }
+
+    fn allocate_configuration_buffer<T: BufferContents + ?Sized>(device_memory_alloc: Arc<dyn MemoryAllocator>) -> Result<Subbuffer<T>, RendererInitializationError> {
+        let result = Buffer::new_unsized(
+            device_memory_alloc,
             BufferCreateInfo {
                 usage: BufferUsage::UNIFORM_BUFFER | BufferUsage::TRANSFER_DST,
                 // flags: (),
@@ -541,23 +671,49 @@ impl Renderer {
                 ..Default::default()
             },
             50 * 1024 * 1024
-        )
-            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=constants_buffer error=failed_creation {e}"))
-            .map_err(RendererInitializationError::BufferCreationFailed)?;
+        );
+        let buffer = match result {
+            Ok(b) => b,
+            Err(e) => {
+                trc::error!("TOTALITY-RENDERER-INIT-FAILED source=configuration_buffer error=failed_creation {e}");
+                return Err(RendererInitializationError::BufferCreationFailed(e));
+            },
+        };
+        Ok(buffer)
+    }
 
-        let command_buffer_alloc = Arc::new(StandardCommandBufferAllocator::new(Arc::clone(&selected_device), StandardCommandBufferAllocatorCreateInfo::default()));
+    fn create_shaders(device: &Arc<Device>) -> Result<ShaderBlock, RendererInitializationError> {
+        let vertex = match shaders::basic_vert::load(device.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                trc::error!("TOTALITY-RENDERER-INIT-FAILED source=shader shader=basic_vert {e}");
+                return Err(RendererInitializationError::ShaderLoadFail("basic_vert", e));
+            },
+        };
+        let geometry = match shaders::basic_geom::load(device.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                trc::error!("TOTALITY-RENDERER-INIT-FAILED source=shader shader=basic_geom {e}");
+                return Err(RendererInitializationError::ShaderLoadFail("basic_geom", e));
+            },
+        };
+        let fragment = match shaders::basic_frag::load(device.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                trc::error!("TOTALITY-RENDERER-INIT-FAILED source=shader shader=basic_frag {e}");
+                return Err(RendererInitializationError::ShaderLoadFail("basic_frag", e));
+            },
+        };
 
-        let vertex_shader = shaders::basic_vert::load(Arc::clone(&selected_device))
-            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=shader shader=basic_vert {e}"))
-            .map_err(|e| RendererInitializationError::ShaderLoadFail("basic_vert", e))?;
-        let geometry_shader = shaders::basic_geom::load(Arc::clone(&selected_device))
-            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=shader shader=basic_geom {e}"))
-            .map_err(|e| RendererInitializationError::ShaderLoadFail("basic_geom", e))?;
-        let fragment_shader = shaders::basic_frag::load(Arc::clone(&selected_device))
-            .tap_err(|e| trc::error!("TOTALITY-RENDERER-INIT-FAILED source=shader shader=basic_frag {e}"))
-            .map_err(|e| RendererInitializationError::ShaderLoadFail("basic_frag", e))?;
+        Ok(ShaderBlock {
+            vertex,
+            geometry,
+            fragment,
+        })
+    }
 
-        let descriptor_set_layout = DescriptorSetLayout::new(Arc::clone(&selected_device), DescriptorSetLayoutCreateInfo {
+    fn create_descriptor_set_layouts(device: &Arc<Device>) -> RendererDescriptorLayouts {
+        let general = DescriptorSetLayout::new(Arc::clone(device), DescriptorSetLayoutCreateInfo {
             flags: DescriptorSetLayoutCreateFlags::empty(),
             bindings: [
                 (0, DescriptorSetLayoutBinding {
@@ -566,24 +722,35 @@ impl Renderer {
                     ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
                 }),
                 (1, DescriptorSetLayoutBinding {
-                    descriptor_count: 1024,
+                    descriptor_count: 1,
                     stages: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
                     ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
                 }),
                 (2, DescriptorSetLayoutBinding {
-                    descriptor_count: 1024,
+                    descriptor_count: 1,
                     stages: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
                     ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
                 }),
                 (3, DescriptorSetLayoutBinding {
-                    descriptor_count: 1024,
+                    descriptor_count: 1,
+                    stages: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
+                }),
+                (4, DescriptorSetLayoutBinding {
+                    descriptor_count: 1,
+                    stages: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
+                }),
+                (5, DescriptorSetLayoutBinding {
+                    descriptor_count: 1,
                     stages: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
                     ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
                 }),
             ].into_iter().collect(),
             ..DescriptorSetLayoutCreateInfo::default()
         }).unwrap();
-        let texture_descriptor_set_layout = DescriptorSetLayout::new(Arc::clone(&selected_device), DescriptorSetLayoutCreateInfo {
+
+        let texture = DescriptorSetLayout::new(Arc::clone(&device), DescriptorSetLayoutCreateInfo {
             flags: DescriptorSetLayoutCreateFlags::empty(),
             bindings: [
                 (0, DescriptorSetLayoutBinding {
@@ -599,21 +766,27 @@ impl Renderer {
             ].into_iter().collect(),
             ..DescriptorSetLayoutCreateInfo::default()
         }).unwrap();
-        let pipeline_layout = PipelineLayout::new(Arc::clone(&selected_device), PipelineLayoutCreateInfo {
+
+        return RendererDescriptorLayouts {
+            general,
+            texture,
+        };
+    }
+
+    fn create_general_render_pipeline_layout(device: &Arc<Device>, general_descriptor_set_layout: Arc<DescriptorSetLayout>, texture_descriptor_set_layout: Arc<DescriptorSetLayout>) -> Arc<PipelineLayout> {
+        PipelineLayout::new(Arc::clone(device), PipelineLayoutCreateInfo {
             flags: PipelineLayoutCreateFlags::default(),
             set_layouts: vec![
-                Arc::clone(&descriptor_set_layout),
-                Arc::clone(&texture_descriptor_set_layout),
+                general_descriptor_set_layout,
+                texture_descriptor_set_layout,
             ],
-            push_constant_ranges: vec![PushConstantRange {
-                stages: ShaderStages::VERTEX | ShaderStages::FRAGMENT | ShaderStages::GEOMETRY,
-                offset: 0,
-                size: 64 + 16,
-            }],
+            push_constant_ranges: vec![],
             ..PipelineLayoutCreateInfo::default()
-        }).unwrap();
+        }).unwrap()
+    }
 
-        let descriptor_pool = DescriptorPool::new(Arc::clone(&selected_device), DescriptorPoolCreateInfo {
+    fn allocate_descriptor_pool(device: &Arc<Device>) -> DescriptorPool {
+        DescriptorPool::new(Arc::clone(&device), DescriptorPoolCreateInfo {
             max_sets: 11, // 1 universal descriptor set, 10 textures allowed.
             pool_sizes: [
                 (DescriptorType::UniformBuffer, 3),
@@ -622,51 +795,75 @@ impl Renderer {
             ].into_iter().collect(),
             flags: DescriptorPoolCreateFlags::empty(),
             ..Default::default()
-        }).unwrap();
-        let descriptor_set_allocator: Arc<dyn DescriptorSetAllocator> = Arc::new(StandardDescriptorSetAllocator::new(
-            Arc::clone(&selected_device),
+        }).unwrap()
+    }
+
+    fn create_descriptor_set_allocator(device: &Arc<Device>, layouts: &RendererDescriptorLayouts) -> Arc<StandardDescriptorSetAllocator> {
+        Arc::new(StandardDescriptorSetAllocator::new(
+            Arc::clone(&device),
             StandardDescriptorSetAllocatorCreateInfo {
-                set_count: descriptor_set_layout.bindings().len() + texture_descriptor_set_layout.bindings().len() * 10,
+                set_count: layouts.general.bindings().len() + layouts.texture.bindings().len() * 10,
                 update_after_bind: false,
                 ..Default::default()
             }
-        ));
+        ))
+    }
+}
+
+impl RendererBuilder {
+    pub fn init(self) -> Result<Renderer, RendererInitializationError> {
+        let (vulkan_prefs, device_prefs) = self.prefs.split();
+
+        let vulkan = Self::initialize_vulkan(self.windowing, vulkan_prefs)?;
+        let physical = Self::select_physical_device(&vulkan, device_prefs)?;
+        let queue_bookmarks = Self::select_queue_family(&physical)?;
+        let (device, selected_device_queue) = Self::create_logical_device(physical.clone(), &queue_bookmarks)?;
+        // TODO Reevaluate if we can adjust the memory allocator.
+        let device_memory_alloc = Arc::new(StandardMemoryAllocator::new_default(Arc::clone(&device)));
+
+        // Let's just allocate giant chunks for:
+        //   - vertices
+        //   - triangles
+        //   - number of values in each
+        //   - model instances
+        //   - lights
+        //   - materials
+        //   - texture staging
+        //   - configuration
+        //   - wireframe rendering
+        //   - camera matrix
+        let vertex_buffer = Self::allocate_vertex_buffer(device_memory_alloc.clone())?;
+        let face_buffer = Self::allocate_face_buffer(device_memory_alloc.clone())?;
+        let uniform_counts_buffer = Self::allocate_count_buffer(device_memory_alloc.clone())?;
+        let uniform_per_mesh_buffer = Self::allocate_mesh_uniform_buffer(device_memory_alloc.clone())?;
+        let uniform_light_buffer = Self::allocate_light_buffer(device_memory_alloc.clone())?;
+        let uniform_material_buffer = Self::allocate_material_buffer(device_memory_alloc.clone())?;
+        let staging_texture_buffer = Self::allocate_texture_staging_buffer(device_memory_alloc.clone())?;
+        let uniform_wireframe_buffer = Self::allocate_wireframe_buffer(device_memory_alloc.clone())?;
+        let uniform_cam_matrix_buffer = Self::allocate_cam_matrix_buffer(device_memory_alloc.clone())?;
+        let configuration_buffer = Self::allocate_configuration_buffer(device_memory_alloc.clone())?;
+
+        let command_buffer_alloc = Arc::new(StandardCommandBufferAllocator::new(Arc::clone(&device), StandardCommandBufferAllocatorCreateInfo::default()));
+
+        let shaders = Self::create_shaders(&device)?;
+
+        let descriptor_set_layouts = Self::create_descriptor_set_layouts(&device);
+
+        let pipeline_layout = Self::create_general_render_pipeline_layout(&device, Arc::clone(&descriptor_set_layouts.general), Arc::clone(&descriptor_set_layouts.texture));
+
+        let descriptor_pool = Self::allocate_descriptor_pool(&device);
+        let descriptor_set_allocator: Arc<dyn DescriptorSetAllocator> = Self::create_descriptor_set_allocator(&device, &descriptor_set_layouts,);
 
         let descriptor_set = DescriptorSet::new(
             Arc::clone(&descriptor_set_allocator),
-            Arc::clone(&descriptor_set_layout),
+            Arc::clone(&descriptor_set_layouts.general),
             [
-                WriteDescriptorSet::buffer(
-                    0,
-                    uniform_counts_buffer.clone().slice(0..16)
-                ),
-                WriteDescriptorSet::buffer_array(
-                    1,
-                    0,
-                    (0..1024).map(|idx| {
-                        let start = idx * 64;
-                        let end = start + 64;
-                        uniform_per_mesh_buffer.clone().slice(start..end)
-                    })
-                ),
-                WriteDescriptorSet::buffer_array(
-                    2,
-                    0,
-                    (0..1024).map(|idx| {
-                        let start = idx * 32;
-                        let end = start + 32;
-                        uniform_light_buffer.clone().slice(start..end)
-                    })
-                ),
-                WriteDescriptorSet::buffer_array(
-                    3,
-                    0,
-                    (0..1024).map(|idx| {
-                        let start = idx * 16;
-                        let end = start + 16;
-                        uniform_material_buffer.clone().slice(start..end)
-                    })
-                ),
+                WriteDescriptorSet::buffer(0, uniform_counts_buffer.clone()),
+                WriteDescriptorSet::buffer(1, uniform_per_mesh_buffer.clone()),
+                WriteDescriptorSet::buffer(2, uniform_light_buffer.clone()),
+                WriteDescriptorSet::buffer(3, uniform_material_buffer.clone()),
+                WriteDescriptorSet::buffer(4, uniform_wireframe_buffer.clone()),
+                WriteDescriptorSet::buffer(5, uniform_cam_matrix_buffer.clone()),
             ],
             [],
         ).unwrap();
@@ -674,7 +871,7 @@ impl Renderer {
             Arc::clone(&device_memory_alloc) as _,
             ImageCreateInfo {
                 image_type: ImageType::Dim2d,
-                format: Format::R32G32B32_SFLOAT,
+                format: Format::R32G32B32A32_SFLOAT,
                 extent: [1, 1, 1],
                 usage: ImageUsage::SAMPLED,
                 ..Default::default()
@@ -686,31 +883,28 @@ impl Renderer {
         let empty_texture_image_view = ImageView::new_default(empty_texture_image).unwrap();
         let empty_texture_descriptor_set = DescriptorSet::new(
             Arc::clone(&descriptor_set_allocator),
-            Arc::clone(&texture_descriptor_set_layout),
+            Arc::clone(&descriptor_set_layouts.texture),
             [
                 WriteDescriptorSet::image_view(0, empty_texture_image_view),
-                WriteDescriptorSet::sampler(1, Sampler::new(Arc::clone(&selected_device), SamplerCreateInfo::simple_repeat_linear_no_mipmap()).unwrap()),
+                WriteDescriptorSet::sampler(1, Sampler::new(Arc::clone(&device), SamplerCreateInfo::simple_repeat_linear_no_mipmap()).unwrap()),
             ],
             [],
         ).unwrap();
         let texture_sampler = Sampler::new(
-            Arc::clone(&selected_device),
+            Arc::clone(&device),
             SamplerCreateInfo {
                 ..SamplerCreateInfo::simple_repeat_linear_no_mipmap()
             },
         ).unwrap();
 
-        Ok(Self {
+        Ok(Renderer {
             vulkan,
 
-            vertex_shader,
-            geometry_shader,
-            fragment_shader,
+            shaders,
 
-            ordered_physical_devices,
-            selected_physical_device_idx,
-            selected_device,
-            selected_device_queues,
+            physical_device: physical,
+            device,
+            selected_device_queue,
 
             device_memory_alloc,
 
@@ -720,15 +914,16 @@ impl Renderer {
             uniform_per_mesh_buffer,
             uniform_light_buffer,
             uniform_material_buffer,
+            uniform_wireframe_buffer,
+            uniform_cam_matrix_buffer,
             staging_texture_buffer,
-            constants_buffer,
+            configuration_buffer,
 
             command_buffer_alloc,
 
             pipeline_layout,
 
-            descriptor_set_layout,
-            texture_descriptor_set_layout,
+            descriptor_set_layouts,
             descriptor_pool,
             descriptor_set_allocator,
             descriptor_set,
@@ -743,9 +938,60 @@ impl Renderer {
             index_free_start: 0,
             vertex_free_byte_start: 0,
             vertex_free_start: 0,
+
+            pipeline_cache: None,
         })
     }
+}
 
+pub struct Renderer {
+    vulkan: Arc<Instance>,
+
+    shaders: ShaderBlock,
+
+    physical_device: Arc<PhysicalDevice>,
+    device: Arc<Device>,
+    selected_device_queue: Arc<Queue>,
+
+    device_memory_alloc: Arc<StandardMemoryAllocator>,
+
+    vertex_buffer: Subbuffer<[u8]>,
+    face_buffer: Subbuffer<[u8]>,
+    uniform_counts_buffer: Subbuffer<[u8]>,
+    uniform_per_mesh_buffer: Subbuffer<[u8]>,
+    uniform_light_buffer: Subbuffer<[u8]>,
+    uniform_material_buffer: Subbuffer<[u8]>,
+    uniform_wireframe_buffer: Subbuffer<[u8]>,
+    uniform_cam_matrix_buffer: Subbuffer<[u8]>,
+    configuration_buffer: Subbuffer<[u8]>,
+    staging_texture_buffer: Subbuffer<[u8]>,
+
+    command_buffer_alloc: Arc<dyn CommandBufferAllocator>,
+
+    pipeline_layout: Arc<PipelineLayout>,
+
+    descriptor_set_layouts: RendererDescriptorLayouts,
+    descriptor_pool: DescriptorPool,
+    descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
+    descriptor_set: Arc<DescriptorSet>,
+    empty_texture_descriptor_set: Arc<DescriptorSet>,
+    texture_sampler: Arc<Sampler>,
+
+    // TODO: better map for window ids?
+    windowed_swapchain: HashMap<WindowId, RendererWindowSwapchain>,
+
+    // Mesh id to (vertex, index) buffer offsets.
+    loaded_models: HashMap<u64, LoadedModelHandles>,
+    vertex_free_byte_start: u64,
+    index_free_byte_start: u64,
+    vertex_free_start: i32,
+    index_free_start: u32,
+
+    pipeline_cache: Option<([u32; 3], u32, WindowId, Arc<GraphicsPipeline>)>,
+}
+
+
+impl Renderer {
     fn copy_sized_slice_to_buffer<U: ?Sized, T: Sized + Copy + std::fmt::Debug + bytemuck::Pod>(buffer: &Subbuffer<U>, to_copy: &[T]) -> Result<(), HostAccessError> {
         let mapped_buffer = unsafe {
             buffer.mapped_slice()?.as_mut()
@@ -762,23 +1008,160 @@ impl Renderer {
         self.loaded_models.clear();
     }
 
-    pub fn render_to<'a>(&mut self, window: Arc<Window>, task: RenderTask<'a>) -> Result<(), Validated<VulkanError>> {
+    pub fn render_to(&mut self, window: Arc<Window>, task: RenderTask<'_>) -> Result<(), Validated<VulkanError>> {
+        struct RenderTimer {
+            start: Instant,
+            inflight_load: Option<Instant>,
+            loads: Vec<Duration>,
+            swapchain_start: Option<Instant>,
+            swapchain_duration: Option<Duration>,
+            framebuffer_acquisition_start: Option<Instant>,
+            framebuffer_acquisition_duration: Option<Duration>,
+            pipeline_construction_start: Option<Instant>,
+            pipeline_construction_duration: Option<Duration>,
+            inflight_command_record: Option<Instant>,
+            command_record_duration: Option<Duration>,
+            inflight_draw: Option<Instant>,
+            draw_duration: Option<Duration>,
+        }
+
+        impl RenderTimer {
+            fn begin() -> Self {
+                Self {
+                    start: Instant::now(),
+                    inflight_load: None,
+                    loads: Vec::with_capacity(20),
+                    swapchain_start: None,
+                    swapchain_duration: None,
+                    framebuffer_acquisition_start: None,
+                    framebuffer_acquisition_duration: None,
+                    pipeline_construction_start: None,
+                    pipeline_construction_duration: None,
+                    inflight_command_record: None,
+                    command_record_duration: None,
+                    inflight_draw: None,
+                    draw_duration: None,
+                }
+            }
+
+            fn record_load_start(&mut self) {
+                self.inflight_load = Some(Instant::now());
+            }
+
+            fn record_load_end(&mut self) {
+                let Some(start) = self.inflight_load else {
+                    return;
+                };
+                self.loads.push(Instant::now() - start);
+            }
+
+            fn record_command_record_start(&mut self) {
+                self.inflight_command_record = Some(Instant::now());
+            }
+
+            fn record_command_record_end(&mut self) {
+                let Some(start) = self.inflight_command_record else {
+                    return;
+                };
+                self.command_record_duration = Some(Instant::now() - start);
+            }
+
+            fn record_draw_start(&mut self) {
+                self.inflight_draw = Some(Instant::now());
+            }
+
+            fn record_draw_end(&mut self) {
+                let Some(start) = self.inflight_draw else {
+                    return;
+                };
+                self.draw_duration = Some(Instant::now() - start);
+            }
+
+            fn record_swapchain_start(&mut self) {
+                self.swapchain_start = Some(Instant::now());
+            }
+
+            fn record_swapchain_end(&mut self) {
+                let Some(start) = self.swapchain_start else {
+                    return;
+                };
+                self.swapchain_duration = Some(Instant::now() - start);
+            }
+
+            fn record_framebuffer_acquisition_start(&mut self) {
+                self.framebuffer_acquisition_start = Some(Instant::now());
+            }
+
+            fn record_framebuffer_acquisition_end(&mut self) {
+                let Some(start) = self.framebuffer_acquisition_start else {
+                    return;
+                };
+                self.framebuffer_acquisition_duration = Some(Instant::now() - start);
+            }
+
+            fn record_pipeline_construction_start(&mut self) {
+                self.pipeline_construction_start = Some(Instant::now());
+            }
+
+            fn record_pipeline_construction_end(&mut self) {
+                let Some(start) = self.pipeline_construction_start else {
+                    return;
+                };
+                self.pipeline_construction_duration = Some(Instant::now() - start);
+            }
+
+            fn record_end(self) {
+                let over = Instant::now() - self.start;
+                let a = 1000. / over.as_millis() as f64;
+                trc::info!(
+                    "RENDER-PASS-TIMING \
+                        fps={a} \
+                        swapchain_duration={:?} \
+                        loads={:?} \
+                        framebuffer_acq={:?} \
+                        pipeline_submission={:?} \
+                        submit={:?} \
+                        draw={:?} \
+                        total={:?}\
+                    ",
+                    self.swapchain_duration,
+                    self.loads,
+                    self.framebuffer_acquisition_duration,
+                    self.pipeline_construction_duration,
+                    self.command_record_duration,
+                    self.draw_duration,
+                    over,
+                );
+            }
+        }
+
         let mut perf = RenderTimer::begin();
 
 
+        perf.record_swapchain_start();
         let mut e = self.windowed_swapchain.entry(window.id());
         let window_swapchain = match e {
             Entry::Vacant(v) => {
-                v.insert(RendererWindowSwapchain::generate_swapchain(&self.vulkan, &window, &self.ordered_physical_devices[self.selected_physical_device_idx], &self.selected_device, &self.device_memory_alloc).unwrap())
+                self.pipeline_cache = None;
+                v.insert(RendererWindowSwapchain::generate_swapchain(
+                        &self.vulkan,
+                        &window,
+                        &self.physical_device,
+                        &self.device,
+                        &self.device_memory_alloc
+                ).unwrap())
             },
             Entry::Occupied(ref mut o) => {
                 let swapchain_information = o.get_mut();
                 if swapchain_information.is_stale_for_window(&window) {
-                    swapchain_information.regenerated_swapchain(&window, &self.ordered_physical_devices[self.selected_physical_device_idx], &self.selected_device, &self.device_memory_alloc).unwrap();
+                    trc::info!("RENDER-PASS-SWAPCHAIN-REGEN");
+                    self.pipeline_cache = None;
+                    swapchain_information.regenerated_swapchain(&window, &self.physical_device, &self.device, &self.device_memory_alloc).unwrap();
                 }
                 swapchain_information
             },
         };
+        perf.record_swapchain_end();
 
         trc::info!("RENDER-PASS-INIT");
 
@@ -799,16 +1182,16 @@ impl Renderer {
                     trc::info!("RENDER-TEXTURE mesh={mesh_id} texture={file_path:?}");
                     assert!(file_path.ends_with(".png"), "only pngs are handled, and only ARGB pngs");
                     let f = std::fs::File::open(file_path).expect("provided file exists");
-                    let texture_file = img::load(std::io::BufReader::new(f), ImageFormat::Png).unwrap().into_rgb32f();
+                    let texture_file = img::load(std::io::BufReader::new(f), ImageFormat::Png).unwrap().into_rgba32f();
                     let (texture_width, texture_height) = (texture_file.width(), texture_file.height());
                     Self::copy_sized_slice_to_buffer(&self.staging_texture_buffer.clone(), texture_file.into_raw().as_slice()).unwrap();
                     let texture_image = Image::new(
                         Arc::clone(&self.device_memory_alloc) as _,
                         ImageCreateInfo {
-                            format: Format::R32G32B32_SFLOAT,
-                            view_formats: vec![Format::R32G32B32_SFLOAT],
+                            format: Format::R32G32B32A32_SFLOAT,
+                            view_formats: vec![Format::R32G32B32A32_SFLOAT],
                             extent: [texture_width, texture_height, 1],
-                            usage: ImageUsage::INPUT_ATTACHMENT | ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                            usage: ImageUsage::INPUT_ATTACHMENT | ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
                             tiling: ImageTiling::Optimal,
                             initial_layout: ImageLayout::Undefined,
                             ..Default::default()
@@ -818,12 +1201,18 @@ impl Renderer {
                             ..Default::default()
                         },
                     ).unwrap();
-                    let texture_image_view = ImageView::new_default(Arc::clone(&texture_image)).unwrap();
+                    let texture_image_view = ImageView::new(
+                        Arc::clone(&texture_image),
+                        ImageViewCreateInfo {
+                            format: Format::R32G32B32A32_SFLOAT,
+                            ..ImageViewCreateInfo::from_image(&texture_image)
+                        },
+                    ).unwrap();
 
                     // TODO Batch these somehow.
                     let mut image_copy_builder = RecordingCommandBuffer::new(
                         Arc::clone(&self.command_buffer_alloc),
-                        self.selected_device_queues[0].queue_family_index(),
+                        self.selected_device_queue.queue_family_index(),
                         CommandBufferLevel::Primary,
                         CommandBufferBeginInfo {
                             usage: CommandBufferUsage::OneTimeSubmit,
@@ -837,15 +1226,15 @@ impl Renderer {
                         })
                         .unwrap();
                     let image_copy_buffer = image_copy_builder.end().unwrap();
-                    vulkano::sync::now(Arc::clone(&self.selected_device))
-                        .then_execute(Arc::clone(&self.selected_device_queues[0]), image_copy_buffer)
+                    vulkano::sync::now(Arc::clone(&self.device))
+                        .then_execute(Arc::clone(&self.selected_device_queue), image_copy_buffer)
                         .unwrap()
                         .flush()
                         .unwrap();
 
                     let texture_descriptor_set = DescriptorSet::new(
                         Arc::clone(&self.descriptor_set_allocator),
-                        Arc::clone(&self.texture_descriptor_set_layout),
+                        Arc::clone(&self.descriptor_set_layouts.texture),
                         [
                             WriteDescriptorSet::image_view(0, texture_image_view),
                             WriteDescriptorSet::sampler(
@@ -886,135 +1275,170 @@ impl Renderer {
             Self::copy_sized_slice_to_buffer(&self.uniform_per_mesh_buffer, task.instancing_information_bytes().as_slice()).unwrap();
             Self::copy_sized_slice_to_buffer(&self.uniform_light_buffer, task.lights.to_bytes().as_slice()).unwrap();
             Self::copy_sized_slice_to_buffer(&self.uniform_counts_buffer, &[0u32, task.lights.0.len() as u32, 0u32, 0u32]).unwrap();
+            Self::copy_sized_slice_to_buffer(&self.uniform_wireframe_buffer, &[if task.draw_wireframe { 1u32 } else { 0u32 }, 0u32, 0u32, 0u32]).unwrap();
+            Self::copy_sized_slice_to_buffer(&self.uniform_cam_matrix_buffer, task.cam.get_vp_mat().as_slice()).unwrap();
             perf.record_load_end();
         }
 
+        perf.record_framebuffer_acquisition_start();
         let (active_framebuffer, afidx, framebuffer_future) = {
             let (mut preferred, mut suboptimal, mut acquire_next_image) = swapchain::acquire_next_image(Arc::clone(&window_swapchain.swapchain), None).unwrap();
             const MAX_RECREATION_OCCURRENCES: usize = 3;
             let mut times_recreated = 0;
             while suboptimal && times_recreated < MAX_RECREATION_OCCURRENCES {
                 times_recreated += 1;
-                window_swapchain.regenerated_swapchain(&window, &self.ordered_physical_devices[self.selected_physical_device_idx], &self.selected_device, &self.device_memory_alloc).unwrap();
+                window_swapchain.regenerated_swapchain(&window, &self.physical_device, &self.device, &self.device_memory_alloc).unwrap();
                 let n = swapchain::acquire_next_image(Arc::clone(&window_swapchain.swapchain), None).unwrap();
-                preferred = n.0;
-                suboptimal = n.1;
-                acquire_next_image = n.2;
+                (preferred, suboptimal, acquire_next_image) = n;
             }
             (&window_swapchain.images[preferred as usize], preferred, acquire_next_image)
         };
+        perf.record_framebuffer_acquisition_end();
 
+        perf.record_pipeline_construction_start();
         let subpass = Subpass::from(Arc::clone(&window_swapchain.render_pass), 0).unwrap();
-        let pipeline = GraphicsPipeline::new(Arc::clone(&self.selected_device), None, GraphicsPipelineCreateInfo {
-            stages: [
-                PipelineShaderStageCreateInfo::new(self.vertex_shader.entry_point("main").unwrap()),
-                PipelineShaderStageCreateInfo::new(self.fragment_shader.entry_point("main").unwrap()),
-                PipelineShaderStageCreateInfo::new(self.geometry_shader.entry_point("main").unwrap()),
-            ].into_iter().collect(),
-            rasterization_state: Some(RasterizationState {
-                cull_mode: CullMode::Back,
-                ..RasterizationState::default()
-            }),
-            input_assembly_state: Some(InputAssemblyState {
-                topology: PrimitiveTopology::TriangleList,
-                ..Default::default()
-            }),
-            vertex_input_state: Some(
-                VertexInputState::new()
-                    .binding(
-                        0,
-                        VertexInputBindingDescription {
-                            stride: 12 + 12 + 8,
-                            input_rate: VertexInputRate::Vertex,
-                            ..Default::default()
-                        },
-                    )
-                    .attribute(
-                        0,
-                        VertexInputAttributeDescription {
-                            binding: 0,
-                            format: Format::R32G32B32_SFLOAT,
-                            offset: 0,
-                            ..Default::default()
-                        },
-                    )
-                    .binding(
-                        1,
-                        VertexInputBindingDescription {
-                            stride: 12 + 12 + 8,
-                            input_rate: VertexInputRate::Vertex,
-                            ..Default::default()
-                        },
-                    )
-                    .attribute(
-                        1,
-                        VertexInputAttributeDescription {
-                            binding: 0,
-                            format: Format::R32G32B32_SFLOAT,
-                            offset: 12,
-                            ..Default::default()
-                        },
-                    )
-                    .binding(
-                        2,
-                        VertexInputBindingDescription {
-                            stride: 12 + 12 + 8,
-                            input_rate: VertexInputRate::Vertex,
-                            ..Default::default()
-                        },
-                    )
-                    .attribute(
-                        2,
-                        VertexInputAttributeDescription {
-                            binding: 0,
-                            format: Format::R32G32_SFLOAT,
-                            offset: 12 + 12,
-                            ..Default::default()
-                        },
-                    )
-            ),
-            viewport_state: Some(ViewportState {
-                viewports: [Viewport {
-                    offset: [0.0; 2],
-                    extent: [active_framebuffer.image.extent()[0] as f32, active_framebuffer.image.extent()[1] as f32],
-                    depth_range: 0.0..=1.0
-                }].into_iter().collect(),
-                scissors: [Scissor {
-                    offset: [0; 2],
-                    extent: [active_framebuffer.image.extent()[0], active_framebuffer.image.extent()[1]],
-                }].into_iter().collect(),
-                ..ViewportState::default()
-            }),
-            multisample_state: Some(MultisampleState {
-                rasterization_samples: SampleCount::Sample1,
-                ..Default::default()
-            }),
-            color_blend_state: Some(ColorBlendState::with_attachment_states(
-                subpass.num_color_attachments(),
-                ColorBlendAttachmentState::default(),
-            )),
-            depth_stencil_state: Some(DepthStencilState {
-                depth: Some(DepthState::simple()),
-                ..Default::default()
-            }),
-            subpass: Some(PipelineSubpassType::BeginRenderPass(subpass)),
-            ..GraphicsPipelineCreateInfo::layout(Arc::clone(&self.pipeline_layout))
-        }).unwrap();
-        trc::info!("RENDER-PASS-PIPELINE descriptor_set={}", pipeline.num_used_descriptor_sets());
+        let active_extent = active_framebuffer.image.extent();
+        let color_attachment_count = subpass.num_color_attachments();
+        let pipeline = if let Some(pipeline) = 'pipeline_cache_check: {
+            let Some((cached_extent, cached_color_attachment_count, cached_window_id, cached_pipeline)) = self.pipeline_cache.as_ref() else {
+                trc::info!("RENDER-PASS-PIPELINE-CACHE cache_miss reason=no_cache");
+                break 'pipeline_cache_check None;
+            };
+            if *cached_extent != active_extent {
+                trc::info!("RENDER-PASS-PIPELINE-CACHE cache_miss reason=extent old={:?} new={:?}", cached_extent, active_extent);
+                break 'pipeline_cache_check None;
+            }
+            if *cached_color_attachment_count != color_attachment_count {
+                trc::info!("RENDER-PASS-PIPELINE-CACHE cache_miss reason=attachment_count old={:?} new={:?}", cached_color_attachment_count, color_attachment_count);
+                break 'pipeline_cache_check None;
+            }
+            if *cached_window_id != window.id() {
+                trc::info!("RENDER-PASS-PIPELINE-CACHE cache_miss reason=window_id old={:?} new={:?}", cached_window_id, window.id());
+                break 'pipeline_cache_check None;
+            }
+            Some(cached_pipeline)
+        } {
+            pipeline.clone()
+        } else {
+            let pipeline = GraphicsPipeline::new(
+                Arc::clone(&self.device),
+                None,
+                GraphicsPipelineCreateInfo {
+                    stages: [
+                        PipelineShaderStageCreateInfo::new(self.shaders.vertex.entry_point("main").unwrap()),
+                        PipelineShaderStageCreateInfo::new(self.shaders.fragment.entry_point("main").unwrap()),
+                        PipelineShaderStageCreateInfo::new(self.shaders.geometry.entry_point("main").unwrap()),
+                    ].into_iter().collect(),
+                    rasterization_state: Some(RasterizationState {
+                        cull_mode: CullMode::Back,
+                        ..RasterizationState::default()
+                    }),
+                    input_assembly_state: Some(InputAssemblyState {
+                        topology: PrimitiveTopology::TriangleList,
+                        ..Default::default()
+                    }),
+                    vertex_input_state: Some(
+                        VertexInputState::new()
+                            .binding(
+                                0,
+                                VertexInputBindingDescription {
+                                    stride: 12 + 12 + 8,
+                                    input_rate: VertexInputRate::Vertex,
+                                    ..Default::default()
+                                },
+                            )
+                            .attribute(
+                                0,
+                                VertexInputAttributeDescription {
+                                    binding: 0,
+                                    format: Format::R32G32B32_SFLOAT,
+                                    offset: 0,
+                                    ..Default::default()
+                                },
+                            )
+                            .binding(
+                                1,
+                                VertexInputBindingDescription {
+                                    stride: 12 + 12 + 8,
+                                    input_rate: VertexInputRate::Vertex,
+                                    ..Default::default()
+                                },
+                            )
+                            .attribute(
+                                1,
+                                VertexInputAttributeDescription {
+                                    binding: 0,
+                                    format: Format::R32G32B32_SFLOAT,
+                                    offset: 12,
+                                    ..Default::default()
+                                },
+                            )
+                            .binding(
+                                2,
+                                VertexInputBindingDescription {
+                                    stride: 12 + 12 + 8,
+                                    input_rate: VertexInputRate::Vertex,
+                                    ..Default::default()
+                                },
+                            )
+                            .attribute(
+                                2,
+                                VertexInputAttributeDescription {
+                                    binding: 0,
+                                    format: Format::R32G32_SFLOAT,
+                                    offset: 12 + 12,
+                                    ..Default::default()
+                                },
+                            )
+                    ),
+                    viewport_state: Some(ViewportState {
+                        viewports: [Viewport {
+                            offset: [0.0; 2],
+                            extent: [active_framebuffer.image.extent()[0] as f32, active_framebuffer.image.extent()[1] as f32],
+                            depth_range: 0.0..=1.0
+                        }].into_iter().collect(),
+                        scissors: [Scissor {
+                            offset: [0; 2],
+                            extent: [active_framebuffer.image.extent()[0], active_framebuffer.image.extent()[1]],
+                        }].into_iter().collect(),
+                        ..ViewportState::default()
+                    }),
+                    multisample_state: Some(MultisampleState {
+                        rasterization_samples: SampleCount::Sample1,
+                        ..Default::default()
+                    }),
+                    color_blend_state: Some(ColorBlendState::with_attachment_states(
+                        subpass.num_color_attachments(),
+                        ColorBlendAttachmentState::default(),
+                    )),
+                    depth_stencil_state: Some(DepthStencilState {
+                        depth: Some(DepthState::simple()),
+                        ..Default::default()
+                    }),
+                    subpass: Some(PipelineSubpassType::BeginRenderPass(subpass)),
+                    ..GraphicsPipelineCreateInfo::layout(Arc::clone(&self.pipeline_layout))
+                }
+            ).unwrap();
+            trc::info!("RENDER-PASS-PIPELINE descriptor_set={}", pipeline.num_used_descriptor_sets());
+            self.pipeline_cache = Some((active_extent, color_attachment_count, window.id(), pipeline.clone()));
+            pipeline
+        };
+        perf.record_pipeline_construction_end();
 
         perf.record_command_record_start();
 
-        let base_queue = &self.selected_device_queues[0];
+        let base_queue = &self.selected_device_queue;
         let mut builder = RecordingCommandBuffer::new(
             Arc::clone(&self.command_buffer_alloc),
-            self.selected_device_queues[0].queue_family_index(),
+            self.selected_device_queue.queue_family_index(),
             CommandBufferLevel::Primary,
             CommandBufferBeginInfo {
                 usage: CommandBufferUsage::OneTimeSubmit,
                 inheritance_info: None,
                 ..Default::default()
             }
-        ).tap_err(|e| trc::error!("TOTALITY-RENDERER-RENDER-TO-FAILED source=clear_pipeline error=command_buffer_alloc {e}"))?;
+        )
+            .tap_err(|e| trc::error!("TOTALITY-RENDERER-RENDER-TO-FAILED source=clear_pipeline error=command_buffer_alloc {e}"))?;
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
@@ -1022,7 +1446,7 @@ impl Renderer {
                         Some(task.clear_color.clone().into()),
                         Some(ClearValue::Depth(1f32))
                     ],
-                    ..RenderPassBeginInfo::framebuffer(Arc::clone(&window_swapchain.images[0].framebuffer))
+                    ..RenderPassBeginInfo::framebuffer(Arc::clone(&active_framebuffer.framebuffer))
                 },
                 SubpassBeginInfo {
                     contents: SubpassContents::Inline,
@@ -1053,10 +1477,6 @@ impl Renderer {
             .bind_vertex_buffers(1, self.vertex_buffer.clone())
             .unwrap()
             .bind_vertex_buffers(2, self.vertex_buffer.clone())
-            .unwrap()
-            .push_constants(Arc::clone(&self.pipeline_layout), 0, task.cam.get_vp_mat())
-            .unwrap()
-            .push_constants(Arc::clone(&self.pipeline_layout), 64, [if task.draw_wireframe { 1u32 } else { 0u32 }, 0u32, 0u32, 0u32])
             .unwrap()
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
@@ -1113,7 +1533,7 @@ impl Renderer {
 
         perf.record_draw_start();
 
-        vulkano::sync::now(Arc::clone(&self.selected_device))
+        vulkano::sync::now(Arc::clone(&self.device))
             .join(framebuffer_future)
             .then_execute(Arc::clone(&base_queue), clear_buffer)
             .unwrap()

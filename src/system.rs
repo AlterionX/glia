@@ -12,7 +12,7 @@ pub struct Inputs {
 
 pub struct Outputs {
     pub kill_txs: Vec<(&'static str, oneshot::Sender<()>)>,
-    pub window_tx: Sender<Arc<Window>>,
+    pub window_tx: Sender<(usize, Arc<Window>)>,
 }
 
 pub struct SystemBus {
@@ -27,14 +27,22 @@ pub struct SystemBusHandle {
 pub struct WindowingManager {
     kill_rx: oneshot::Receiver<()>,
     pub kill_txs: Vec<(&'static str, oneshot::Sender<()>)>,
+    window_generation: usize,
     window: Option<Arc<Window>>,
+    window_tx: Sender<(usize, Arc<Window>)>,
     should_exit: bool,
 }
 
 impl ApplicationHandler for WindowingManager {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        let w = event_loop.create_window(Window::default_attributes()).unwrap();
-        self.window = Some(Arc::new(w));
+        let w = Arc::new(event_loop.create_window(Window::default_attributes()).unwrap());
+        let gen = self.window_generation;
+        self.window_generation += 1;
+        self.window = Some(w.clone());
+        let tx = self.window_tx.clone();
+        tokio::spawn(async move {
+            tx.send((gen, w)).await.expect("render thread to be fine");
+        });
     }
 
     fn window_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, window_id: winit::window::WindowId, event: winit::event::WindowEvent) {
@@ -43,6 +51,78 @@ impl ApplicationHandler for WindowingManager {
             self.should_exit = true;
             return;
         }
+
+        /*
+                DeviceEvent::Key(key_in) => match key_in.physical_key {
+                    PhysicalKey::Code(keycode) => match keycode {
+                        // We'll just ignore modifiers for now.
+                        KeyCode::Escape => { elwt.exit(); },
+                        KeyCode::KeyW => {
+                            tx.send(WorldEvent::SetMoveForward(key_in.state.is_pressed())).unwrap();
+                        },
+                        KeyCode::KeyA => {
+                            tx.send(WorldEvent::SetMoveLeft(key_in.state.is_pressed())).unwrap();
+                        },
+                        KeyCode::KeyS => {
+                            tx.send(WorldEvent::SetMoveBackward(key_in.state.is_pressed())).unwrap();
+                        },
+                        KeyCode::KeyD => {
+                            tx.send(WorldEvent::SetMoveRight(key_in.state.is_pressed())).unwrap();
+                        },
+                        KeyCode::KeyQ => {
+                            tx.send(WorldEvent::SetRollRight(key_in.state.is_pressed())).unwrap();
+                        },
+                        KeyCode::KeyE => {
+                            tx.send(WorldEvent::SetRollLeft(key_in.state.is_pressed())).unwrap();
+                        },
+                        KeyCode::Space => {
+                            tx.send(WorldEvent::SetMoveUp(key_in.state.is_pressed())).unwrap();
+                        },
+                        KeyCode::ControlLeft => {
+                            tx.send(WorldEvent::SetMoveDown(key_in.state.is_pressed())).unwrap();
+                        },
+                        KeyCode::KeyN => {
+                            tx.send(WorldEvent::ShiftBackground(key_in.state.is_pressed())).unwrap();
+                        },
+                        KeyCode::Tab => {
+                            tx.send(WorldEvent::ToggleWireFrame(key_in.state.is_pressed())).unwrap();
+                        },
+                        _ => {},
+                    },
+                    PhysicalKey::Unidentified(_native) => {},
+                },
+                DeviceEvent::MouseMotion { delta: (maybe_xd, maybe_yd) } => {
+                    let (xd, yd) = match FORCE_MOUSE_MOTION_MODE {
+                        Some(MouseMotionMode::Relative) => (maybe_xd, maybe_yd),
+                        Some(MouseMotionMode::Warp) => {
+                            (calc_relative_motion(&mut last_mouse_x, maybe_xd), calc_relative_motion(&mut last_mouse_y, maybe_yd))
+                        },
+                        None => {
+                            // We'll kind of guess if this is correct.
+                            // Absolute values tend to be large -- break on > 2000.
+                            // This can probably be better.
+                            let is_probably_absolute = warp_mouse_detected || (maybe_xd * maybe_xd + maybe_yd * maybe_yd) > (2000. * 2000.);
+                            if is_probably_absolute {
+                                warp_mouse_detected = true;
+                            }
+                            if is_probably_absolute {
+                                (calc_relative_motion(&mut last_mouse_x, maybe_xd), calc_relative_motion(&mut last_mouse_y, maybe_yd))
+                            } else {
+                                (maybe_xd, maybe_yd)
+                            }
+                        },
+                    };
+
+                    let scaling_factor = std::f64::consts::PI / 500.;
+                    let x_scaling_factor = -scaling_factor;
+                    let y_scaling_factor = -scaling_factor / 5.;
+                    log::info!("MOUSE-MOVED x={xd} y={yd}");
+
+                    tx.send(WorldEvent::Pitch((yd * y_scaling_factor) as f32)).unwrap();
+                    tx.send(WorldEvent::Yaw((xd * x_scaling_factor) as f32)).unwrap();
+                },
+                _ => {},
+         */
 
         match event {
             WindowEvent::CloseRequested => {
@@ -100,7 +180,9 @@ impl SystemBus {
         let mut wm = WindowingManager {
             kill_rx: self.inputs.kill_rx,
             kill_txs: self.outputs.kill_txs,
+            window_generation: 0,
             window: None,
+            window_tx: self.outputs.window_tx,
             should_exit: false,
         };
 

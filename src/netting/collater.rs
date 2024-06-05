@@ -2,7 +2,7 @@ use std::{collections::{HashMap, VecDeque}, fmt::Debug, sync::{atomic::AtomicUsi
 
 use tokio::{sync::{mpsc::{Receiver, Sender}, oneshot}, task::JoinHandle};
 
-use crate::{exec::{self, ReceiverTimeoutExt}, netting::{NettingMessage, NettingMessageParseError}};
+use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter}, netting::{NettingMessage, NettingMessageParseError}};
 
 use super::{AttributedInboundBytes, InboundNettingMessage, NettingMessageBytesWithOrdering};
 
@@ -30,15 +30,12 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Collater<W>
     }
 
     pub fn start(mut self) -> JoinHandle<()> {
-        exec::spawn_kill_reporting(self.inputs.death_tally, async move {
+        ThreadDeathReporter::new(&self.inputs.death_tally, "net-collater").spawn(async move {
             let mut cached_unsent_netting_messages = VecDeque::with_capacity(5);
             // TODO Periodically clean up old values.
             let mut cached_partials: HashMap<_, Vec<NettingMessageBytesWithOrdering>> = HashMap::new();
             loop {
-                if exec::kill_requested(&mut self.inputs.kill_rx) {
-                    trc::info!("KILL net collater");
-                    return;
-                }
+                if exec::kill_requested(&mut self.inputs.kill_rx) { return; }
 
                 let Some(known_msg) = self.inputs.iknown_rx.recv_for_ms(100).await.value() else {
                     continue;

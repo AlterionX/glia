@@ -3,12 +3,12 @@ use std::borrow::Cow;
 use na::{Matrix4, Vector3, UnitVector3};
 use vulkano::format::ClearColorValue;
 
-use model::geom::tri::TriMeshGeom;
+use crate::model::{camera::Camera, geom::tri::TriMeshGeom, AffineTransform};
 
 #[derive(Debug, Clone)]
 pub struct RenderTask<'a> {
     pub draw_wireframe: bool,
-    pub cam: &'a model::camera::Camera,
+    pub cam: &'a Camera,
     pub draws: Vec<DrawTask<'a>>,
     pub clear_color: ClearColorValue,
     pub lights: LightCollection,
@@ -86,7 +86,7 @@ impl DirectionalLight {
 #[derive(Debug, Clone)]
 pub struct DrawTask<'a> {
     pub mesh: Cow<'a, TriMeshGeom>,
-    pub instancing_information: Vec<Cow<'a, model::AffineTransform>>,
+    pub instancing_information: Vec<Cow<'a, AffineTransform>>,
 }
 
 impl<'a> RenderTask<'a> {

@@ -2,7 +2,7 @@ use std::{collections::VecDeque, fmt::Debug, sync::{atomic::AtomicUsize, Arc}};
 
 use tokio::{sync::{mpsc::{Receiver, Sender}, oneshot}, task::JoinHandle};
 
-use crate::{exec::{self, ReceiverTimeoutExt}, netting::{OutboundSynapseTransmission, OutboundSynapseTransmissionKind}};
+use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter}, netting::{OutboundSynapseTransmission, OutboundSynapseTransmissionKind}};
 
 use super::{ClientId, NettingMessage};
 
@@ -30,13 +30,10 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Parceler<W>
     }
 
     pub fn start(mut self) -> JoinHandle<()> {
-        exec::spawn_kill_reporting(self.inputs.death_tally, async move {
+        ThreadDeathReporter::new(&self.inputs.death_tally, "net-parceler").spawn(async move {
             let mut cached_unsent_osynts = VecDeque::with_capacity(5);
             loop {
-                if exec::kill_requested(&mut self.inputs.kill_rx) {
-                    trc::info!("KILL net parceler");
-                    return;
-                }
+                if exec::kill_requested(&mut self.inputs.kill_rx) { return; }
 
                 let Some((msg, client_id)) = self.inputs.onm_rx.recv_for_ms(100).await.value() else {
                     continue;

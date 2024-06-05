@@ -3,7 +3,7 @@ use std::{collections::{HashMap, VecDeque}, fmt::Debug, sync::{atomic::{AtomicBo
 use chrono::{DateTime, Utc};
 use tokio::{sync::{mpsc::Receiver, oneshot, RwLock}, task::JoinHandle};
 
-use crate::{exec::{self, ReceiverTimeoutExt, TimeoutOutcome}, netting::{ClientId, NettingApi, NettingMessageKind}};
+use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter, TimeoutOutcome}, netting::{ClientId, NettingApi, NettingMessageKind}};
 
 // TODO use a triple buffer with some network-related niceties
 #[derive(Default)]
@@ -162,12 +162,9 @@ impl<
         //     // sure how the game world will react to this, though.
         // });
 
-        let sim_handle = exec::spawn_kill_reporting(self.death_tally, async move {
+        let sim_handle = ThreadDeathReporter::new(&self.death_tally, "sim").spawn(async move {
             loop {
-                if exec::kill_requested(&mut self.kill_rx) {
-                    trc::info!("KILL sim");
-                    return;
-                }
+                if exec::kill_requested(&mut self.kill_rx) { return; }
 
                 self.running.store(false, std::sync::atomic::Ordering::Relaxed);
                 while let Some(run_state) = self.run_state_rx.recv().await {

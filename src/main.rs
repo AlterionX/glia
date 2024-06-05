@@ -10,6 +10,7 @@ mod render;
 mod input;
 mod system;
 mod bus;
+mod model;
 
 // Actual game modules.
 mod world;
@@ -18,6 +19,7 @@ use std::{error::Error, fmt::Display, net::IpAddr, sync::{atomic::{AtomicBool, A
 
 use chrono::{DateTime, Duration, TimeDelta, Utc};
 
+use exec::ThreadDeathReporter;
 use render::Render;
 use tokio::{io::{AsyncBufReadExt, BufReader}, sync::{mpsc, oneshot}};
 
@@ -184,6 +186,7 @@ fn main() {
             todo!("handle error report -- {err:?}");
         },
     }});
+    // TODO determine why this is necessary.
     rt.shutdown_timeout(TimeDelta::milliseconds(10).to_std().unwrap());
 }
 
@@ -295,7 +298,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
         ],
     });
 
-    exec::spawn_kill_reporting(death_tally, async move {
+    ThreadDeathReporter::new(&death_tally, "tio").spawn(async move {
         // Input buffer
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
 
@@ -304,10 +307,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
         let line = loop {
             tokio::select! {
                 _ = tokio::time::sleep(chrono::Duration::milliseconds(100).to_std().unwrap()) => {
-                    if exec::kill_requested(&mut tio_kill_rx) {
-                        trc::info!("KILL tio");
-                        return;
-                    }
+                    if exec::kill_requested(&mut tio_kill_rx) { return; }
                 },
                 read_line = lines.next_line() => match read_line {
                     Ok(Some(l)) => {
@@ -337,13 +337,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
             let line = loop {
                 tokio::select! {
                     _ = tokio::time::sleep(chrono::Duration::milliseconds(100).to_std().unwrap()) => {
-                        match tio_kill_rx.try_recv() {
-                            Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
-                                trc::info!("KILL tio");
-                                break 'main_loop;
-                            },
-                            Err(oneshot::error::TryRecvError::Empty) => {},
-                        }
+                        if exec::kill_requested(&mut tio_kill_rx) { break 'main_loop; }
                     },
                     read_line = lines.next_line() => match read_line {
                         Ok(Some(l)) => {

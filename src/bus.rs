@@ -1,9 +1,9 @@
 use std::{collections::{hash_map, HashMap}, fmt::Debug, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}};
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use tokio::{task::JoinHandle, sync::{mpsc::{Sender, Receiver}, oneshot}};
 
-use crate::{exec::{self, ReceiverTimeoutExt}, netting::{ClientId, InboundNettingMessage, NettingApi, NettingMessageKind}, simulation::{SnapshotWorldState, SynchronizedSimulatable}};
+use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter}, netting::{ClientId, InboundNettingMessage, NettingApi, NettingMessageKind}, simulation::{SnapshotWorldState, SynchronizedSimulatable}};
 
 pub struct Inputs<W> {
     pub sim_running: Arc<AtomicBool>,
@@ -35,15 +35,12 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clo
     }
 
     pub fn start(mut self) -> JoinHandle<()> {
-        exec::spawn_kill_reporting(self.inputs.death_tally, async move {
+        ThreadDeathReporter::new(&self.inputs.death_tally, "bus").spawn(async move {
             // Local record to avoid lock contention.
             let mut framesync_records = HashMap::new();
 
             loop {
-                if exec::kill_requested(&mut self.inputs.kill_rx) {
-                    trc::info!("KILL bus");
-                    return;
-                }
+                if exec::kill_requested(&mut self.inputs.kill_rx) { return; }
 
                 let Some(inbound_msg) = self.inputs.inm_rx.recv_for_ms(100).await.value() else {
                     continue;

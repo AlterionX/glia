@@ -12,7 +12,7 @@ use chacha::{aead::Aead, AeadCore, KeyInit};
 use mio::{net::UdpSocket, Events, Interest, Poll, Token};
 use tokio::{sync::{mpsc::{self, error::TryRecvError, Receiver, Sender}, oneshot}, task::JoinHandle};
 
-use crate::{exec, netting::{ClientId, NettingMessageKind, OutboundSynapseTransmissionKind, SynapseTransmission, SynapseTransmissionKind}};
+use crate::{exec::{self, ThreadDeathReporter}, netting::{ClientId, NettingMessageKind, OutboundSynapseTransmissionKind, SynapseTransmission, SynapseTransmissionKind}};
 
 use super::{AttributedInboundBytes, InboundNettingMessage, OutboundSynapseTransmission};
 
@@ -423,7 +423,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> ConnectionM
     }
 
     pub fn start(mut self) -> JoinHandle<()> {
-        exec::spawn_kill_reporting(self.inputs.death_tally, async move {
+        ThreadDeathReporter::new(&self.inputs.death_tally, "net-connman").spawn(async move {
             self.poll.registry().register(&mut self.outputs.socket, Self::OWN_PORT_TOPIC, Interest::READABLE | Interest::WRITABLE).unwrap();
             let mut dg_buf_mem = [0u8; MAX_UDP_DG_SIZE];
             let dg_buf = dg_buf_mem.as_mut_slice();
@@ -434,10 +434,8 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> ConnectionM
 
             // TODO Make this await a bit more.
             loop {
-                if exec::kill_requested(&mut self.inputs.kill_rx) {
-                    trc::info!("KILL net connman");
-                    return;
-                }
+                if exec::kill_requested(&mut self.inputs.kill_rx) { return; }
+
                 tokio::time::sleep(TimeDelta::milliseconds(1).to_std().unwrap()).await;
                 self.poll.poll(&mut self.events, Some(TimeDelta::milliseconds(10).to_std().unwrap())).expect("no issues polling");
                 for event in self.events.iter() {

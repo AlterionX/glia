@@ -1,4 +1,4 @@
-use std::{future::Future, sync::{atomic::AtomicUsize, Arc}};
+use std::{borrow::Cow, future::Future, sync::{atomic::AtomicUsize, Arc}};
 
 use chrono::TimeDelta;
 
@@ -15,12 +15,27 @@ pub fn kill_requested(kill_rx: &mut tokio::sync::oneshot::Receiver<()>) -> bool 
     }
 }
 
-pub fn spawn_kill_reporting<T: Send + 'static>(reporter: Arc<AtomicUsize>, f: impl Future<Output=T> + Send + 'static) -> tokio::task::JoinHandle<T> {
-    tokio::spawn(async move {
-        let a = f.await;
-        reporter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        a
-    })
+pub struct ThreadDeathReporter {
+    name: Cow<'static, str>,
+    death_tally: Arc<AtomicUsize>,
+}
+
+impl ThreadDeathReporter {
+    pub fn new(tally: &Arc<AtomicUsize>, name: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            death_tally: Arc::clone(tally),
+            name: name.into(),
+        }
+    }
+
+    pub fn spawn<T: Send + 'static>(self, f: impl Future<Output=T> + Send + 'static) -> tokio::task::JoinHandle<T> {
+        tokio::spawn(async move {
+            let a = f.await;
+            trc::info!("KILL Death: {}", self.name.as_ref());
+            self.death_tally.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            a
+        })
+    }
 }
 
 pub enum TimeoutOutcome<T> {
