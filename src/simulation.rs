@@ -1,9 +1,9 @@
 use std::{collections::{HashMap, VecDeque}, fmt::Debug, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}};
 
 use chrono::{DateTime, Utc};
-use tokio::{sync::{mpsc::Receiver, oneshot, RwLock}, task::JoinHandle};
+use tokio::{sync::{mpsc::{Receiver, Sender}, oneshot, RwLock}, task::JoinHandle};
 
-use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter, TimeoutOutcome}, netting::{ClientId, NettingApi, NettingMessageKind}};
+use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter, TimeoutOutcome}, netting::{ClientId, NettingApi, NettingMessageKind}, render::{RenderScene, SimRenderRequest}};
 
 // TODO use a triple buffer with some network-related niceties
 #[derive(Default)]
@@ -101,6 +101,7 @@ pub struct Inputs<W> {
 pub struct Outputs {
     /// This represents if the simulation is currently running.
     pub running: Arc<AtomicBool>,
+    pub draw_call_tx: Sender<RenderScene>,
 }
 
 pub struct Simulation<W, A> {
@@ -114,6 +115,7 @@ pub struct Simulation<W, A> {
     request_snapshot_rx: Receiver<oneshot::Sender<SnapshotWorldState<W>>>,
     framesync_recv_rx: Receiver<(ClientId, u64)>,
     death_tally: Arc<AtomicUsize>,
+    draw_call_tx: Sender<RenderScene>,
 
     net_api: NettingApi<W>,
 }
@@ -130,6 +132,7 @@ impl <W: Default + Clone, A> Simulation<W, A> {
             request_snapshot_rx: inputs.request_snapshot_rx,
             framesync_recv_rx: inputs.framesync_recv_rx,
             framesync: FrameSync::new(),
+            draw_call_tx: outputs.draw_call_tx,
             death_tally: inputs.death_tally,
             net_api: inputs.net_api,
         }
@@ -228,6 +231,16 @@ impl<
                     }
 
                     target_sim_time += chrono::TimeDelta::milliseconds(1000 / i64::from(super::TARGET_FPS));
+
+                    // This doesn't send the world state in case the render thread is being slow.
+                    // The render thread will filter out
+                    let temp_channel = self.draw_call_tx.clone();
+                    tokio::spawn(async move {
+                        // TODO Change this to actual scene render
+                        temp_channel.send(RenderScene::Sim(SimRenderRequest {
+                            color: [1, 1, 1],
+                        })).await.ok();
+                    });
                 }
             }
         });
@@ -341,7 +354,7 @@ impl FrameSync {
                 limiter = Some(prev);
             }
         }
-        trc::info!("FRAMESYNC-LIMITER-RECORD center={position:?} limiter={limiter:?}");
+        trc::trace!("FRAMESYNC-LIMITER-RECORD center={position:?} limiter={limiter:?}");
         // If we don't have an earliest frame, assume we're alone and proceed as if we can
         // continue.
         let (_, limiting_frame, _) = limiter?;

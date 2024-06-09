@@ -683,12 +683,6 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> ConnectionM
                         ], addr).expect("socket to be okay");
                     }
                     // TODO this should back off from time to time
-                    for (a, b, c) in connections.connections.iter() {
-                        let total_message = c.active_messages.iter().filter(|(len, _bytes)| *len != 0).count();
-                        if total_message != 0 {
-                            trc::info!("WTF data: {:?} client_id: {:?} messages: {:?}", a, b, total_message);
-                        }
-                    }
                     let mut data = connections.addr_data_iter_mut();
                     while let Some((addr, (st_len, st_bytes), i)) = data.next() {
                         if *st_len == 0 {

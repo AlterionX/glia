@@ -42,9 +42,9 @@ pub struct Configuration {
 const DEFAULT_FILE: &str = "config/cfg.toml";
 const ENV_PREFIX: &str = "GLIA";
 
-pub fn read() -> Result<Box<Configuration>, ReportableError> {
+pub fn read(arg_file: &str) -> Result<Box<Configuration>, ReportableError> {
     let cfg = Config::builder()
-        .add_source(config::File::new(DEFAULT_FILE, config::FileFormat::Toml))
+        .add_source(config::File::new(arg_file, config::FileFormat::Toml))
         .add_source(config::Environment::with_prefix(ENV_PREFIX))
         .build()
         .map_err(err_mapper)?;

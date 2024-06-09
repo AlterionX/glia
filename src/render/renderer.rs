@@ -56,7 +56,8 @@ use vulkano::{
                 ViewportState,
             }, GraphicsPipelineCreateInfo
         }, layout::{
-            PipelineLayoutCreateFlags, PipelineLayoutCreateInfo, PushConstantRange
+            PipelineLayoutCreateFlags,
+            PipelineLayoutCreateInfo,
         },
         Pipeline,
         GraphicsPipeline,

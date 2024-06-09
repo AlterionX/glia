@@ -38,7 +38,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Parceler<W>
                 let Some((msg, client_id)) = self.inputs.onm_rx.recv_for_ms(100).await.value() else {
                     continue;
                 };
-                trc::info!("NET-ONM Sending {msg:?}");
+                trc::trace!("NET-ONM Sending {msg:?}");
                 // TODO Break apart into multiple osynts and shove through the network. Drop for
                 // now.
                 for bytes in msg.into_known_packet_bytes() {

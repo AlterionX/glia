@@ -1,8 +1,8 @@
 use std::sync::{atomic::AtomicUsize, Arc};
 
 use renderer::{RendererBuilder, RendererPreferences};
-use task::{DrawTask, LightCollection, RenderTask};
-use tokio::{sync::{mpsc::Receiver, oneshot}, task::JoinHandle};
+use task::{LightCollection, RenderTask};
+use tokio::{sync::{mpsc::{Receiver, error::TryRecvError}, oneshot}, task::JoinHandle};
 use vulkano::format::ClearColorValue;
 use winit::window::Window;
 
@@ -14,8 +14,13 @@ pub mod task;
 mod renderer;
 mod shaders;
 
+#[derive(Debug, Clone)]
+pub struct SimRenderRequest {
+    pub color: [u32; 3],
+}
+
 pub enum RenderScene {
-    Sim,
+    Sim(SimRenderRequest),
     Menu,
     MainMenu,
 }
@@ -58,8 +63,8 @@ impl Render {
             let mut renderer_cache = None;
             let mut window_cache = None;
 
-            loop {
-                trc::info!("RENDER trigger");
+            'main_loop: loop {
+                trc::trace!("RENDER trigger");
 
                 if exec::kill_requested(&mut self.inputs.kill_rx) { return; }
 
@@ -98,14 +103,29 @@ impl Render {
                     renderer_cache = Some(renderer);
                     continue;
                 };
-                while let Ok(next_initial) = self.inputs.trigger_render_rx.try_recv() {
-                    initial = next_initial;
+                while let Some(render_scene) = match self.inputs.trigger_render_rx.try_recv() {
+                    Ok(v) => Some(v),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => {
+                        window_cache = Some((stashed_gen, window));
+                        renderer_cache = Some(renderer);
+                        continue 'main_loop;
+                    },
+                } {
+                    initial = render_scene;
                 }
                 // TODO Actually handle the responses.
 
-                let draw_calls = match initial {
-                    RenderScene::Sim => {
-                        determine_sim_draw_calls()
+                let render_task = match initial {
+                    RenderScene::Sim(req) => {
+                        trc::info!("color {:?}", req.color);
+                        RenderTask {
+                            draw_wireframe: false,
+                            clear_color: ClearColorValue::Uint([req.color[0], req.color[1], req.color[2], 1]),
+                            draws: vec![],
+                            lights: LightCollection(vec![]),
+                            cam: &Camera::Orthographic(OrthoCamera::default()),
+                        }
                     },
                     RenderScene::Menu => {
                         determine_menu_draw_calls()
@@ -115,13 +135,7 @@ impl Render {
                     },
                 };
 
-                renderer.render_to(window.clone(), RenderTask {
-                    draw_wireframe: false,
-                    clear_color: ClearColorValue::Uint([0, 0, 0, 1]),
-                    draws: draw_calls,
-                    lights: LightCollection(vec![]),
-                    cam: &Camera::Orthographic(OrthoCamera::default()),
-                }).expect("rendering to be fine");
+                renderer.render_to(window.clone(), render_task).expect("rendering to be fine");
 
                 window_cache = Some((stashed_gen, window));
                 renderer_cache = Some(renderer);
@@ -132,14 +146,10 @@ impl Render {
     }
 }
 
-fn determine_sim_draw_calls<'a>() -> Vec<DrawTask<'a>> {
-    vec![]
-}
-
-fn determine_menu_draw_calls<'a>() -> Vec<DrawTask<'a>> {
+fn determine_menu_draw_calls<'a>() -> RenderTask<'a> {
     todo!("menu not implemented");
 }
 
-fn determine_main_menu_draw_calls<'a>() -> Vec<DrawTask<'a>> {
+fn determine_main_menu_draw_calls<'a>() -> RenderTask<'a> {
     todo!("main menu not implemented");
 }

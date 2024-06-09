@@ -15,7 +15,7 @@ mod model;
 // Actual game modules.
 mod world;
 
-use std::{error::Error, fmt::Display, net::IpAddr, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}};
+use std::{env::args, error::Error, fmt::Display, net::IpAddr, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}};
 
 use chrono::{DateTime, Duration, TimeDelta, Utc};
 
@@ -176,6 +176,24 @@ impl Renderer {
 }
 
 fn main() {
+    let cfg = {
+        let mut arg = args();
+        let Some(_script_name) = arg.next() else {
+            println!("How is this missing the script name?");
+            return;
+        };
+        let Some(cfg_file) = arg.next() else {
+            println!("a configuration file must be passed in as the first argument");
+            return;
+        };
+        if arg.next().is_some() {
+            println!("only the configuration file is expected as an argument, extra argument detected");
+            return;
+        }
+        Box::leak(cfg::read(cfg_file.as_str()).expect("configuration is okay"))
+    };
+    log::setup(cfg).expect("logging configuration is okay");
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -205,9 +223,6 @@ impl Error for ReportableError {
 }
 
 async fn main_with_error_handler() -> Result<(), ReportableError> {
-    let cfg = Box::leak(cfg::read()?);
-    log::setup(cfg)?;
-
     // Networking channels
     let (osynt_tx, osynt_rx) = mpsc::channel(1024);
     let (onm_tx, onm_rx) = mpsc::channel(1024);
@@ -273,6 +288,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
         death_tally: Arc::clone(&death_tally),
     }, simulation::Outputs {
         running: Arc::clone(&sim_running),
+        draw_call_tx,
     });
     let ren = Render::init(render::Inputs {
         window_rx,
