@@ -156,15 +156,6 @@ impl<
         // let actions_since_sync: Vec<UserAction> = vec![];
         // let worlds_since_sync: Vec<(DateTime<Utc>, World)> = vec![];
 
-        // let network_input_thread = s.spawn(|| loop {
-        //     if game_complete.load(Ordering::Relaxed) {
-        //         break;
-        //     }
-        //     // Read user input, network events and rearrange them. Also manage periodic sync.
-        //     // Also ruthlessly kill connections if they haven't been around for a minute. Not
-        //     // sure how the game world will react to this, though.
-        // });
-
         let sim_handle = ThreadDeathReporter::new(&self.death_tally, "sim").spawn(async move {
             loop {
                 if exec::kill_requested(&mut self.kill_rx) { return; }
@@ -180,6 +171,15 @@ impl<
                 // The world loops repeatedly.
                 let mut target_sim_time = Utc::now();
                 loop {
+                    // let network_input_thread = s.spawn(|| loop {
+                    //     if game_complete.load(Ordering::Relaxed) {
+                    //         break;
+                    //     }
+                    //     // Read user input, network events and rearrange them. Also manage periodic sync.
+                    //     // Also ruthlessly kill connections if they haven't been around for a minute. Not
+                    //     // sure how the game world will react to this, though.
+                    // });
+
                     let now = Utc::now();
                     if now < target_sim_time {
                         match self.force_jump_rx.recv_for(target_sim_time - now).await {
@@ -238,7 +238,7 @@ impl<
                     tokio::spawn(async move {
                         // TODO Change this to actual scene render
                         temp_channel.send(RenderScene::Sim(SimRenderRequest {
-                            color: [1, 1, 1],
+                            color: [1., 1., 1.],
                         })).await.ok();
                     });
                 }

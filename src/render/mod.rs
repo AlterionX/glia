@@ -16,7 +16,7 @@ mod shaders;
 
 #[derive(Debug, Clone)]
 pub struct SimRenderRequest {
-    pub color: [u32; 3],
+    pub color: [f32; 3],
 }
 
 pub enum RenderScene {
@@ -121,7 +121,7 @@ impl Render {
                         trc::info!("color {:?}", req.color);
                         RenderTask {
                             draw_wireframe: false,
-                            clear_color: ClearColorValue::Uint([req.color[0], req.color[1], req.color[2], 1]),
+                            clear_color: ClearColorValue::Float([req.color[0], req.color[1], req.color[2], 1.]),
                             draws: vec![],
                             lights: LightCollection(vec![]),
                             cam: &Camera::Orthographic(OrthoCamera::default()),
