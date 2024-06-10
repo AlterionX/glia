@@ -6,9 +6,9 @@ use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter}, netting::{Out
 
 use super::{ClientId, NettingMessage};
 
-pub struct Inputs<W> {
+pub struct Inputs<W, A> {
     pub kill_rx: oneshot::Receiver<()>,
-    pub onm_rx: Receiver<(NettingMessage<W>, Option<ClientId>)>,
+    pub onm_rx: Receiver<(NettingMessage<W, A>, Option<ClientId>)>,
     pub death_tally: Arc<AtomicUsize>,
 }
 
@@ -16,13 +16,13 @@ pub struct Outputs {
     pub osynt_tx: Sender<OutboundSynapseTransmission>,
 }
 
-pub struct Parceler<W> {
-    inputs: Inputs<W>,
+pub struct Parceler<W, A> {
+    inputs: Inputs<W, A>,
     outputs: Outputs,
 }
 
-impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Parceler<W> {
-    pub fn init(inputs: Inputs<W>, outputs: Outputs) -> Self {
+impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static, A: bincode::Decode + bincode::Encode + Debug + Send + 'static> Parceler<W, A> {
+    pub fn init(inputs: Inputs<W, A>, outputs: Outputs) -> Self {
         Self {
             inputs,
             outputs,

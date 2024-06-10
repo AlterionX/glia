@@ -8,7 +8,7 @@ use crate::model::{camera::Camera, geom::tri::TriMeshGeom, AffineTransform};
 #[derive(Debug, Clone)]
 pub struct RenderTask<'a> {
     pub draw_wireframe: bool,
-    pub cam: &'a Camera,
+    pub cam: Camera,
     pub draws: Vec<DrawTask<'a>>,
     pub clear_color: ClearColorValue,
     pub lights: LightCollection,

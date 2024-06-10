@@ -12,17 +12,17 @@ pub struct Inputs {
     pub death_tally: Arc<AtomicUsize>,
 }
 
-pub struct Outputs<W> {
-    pub inm_tx: Sender<InboundNettingMessage<W>>,
+pub struct Outputs<W, A> {
+    pub inm_tx: Sender<InboundNettingMessage<W, A>>,
 }
 
-pub struct Collater<W> {
+pub struct Collater<W, A> {
     inputs: Inputs,
-    outputs: Outputs<W>,
+    outputs: Outputs<W, A>,
 }
 
-impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Collater<W> {
-    pub fn init(inputs: Inputs, outputs: Outputs<W>) -> Collater<W> {
+impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static, A: bincode::Decode + bincode::Encode + Debug + Send + 'static> Collater<W, A> {
+    pub fn init(inputs: Inputs, outputs: Outputs<W, A>) -> Collater<W, A> {
         Collater {
             inputs,
             outputs,

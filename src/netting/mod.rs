@@ -10,8 +10,6 @@ use mio::net::UdpSocket;
 use tap::TapFallible;
 use tokio::{sync::{mpsc::{self, Receiver, Sender, error::SendError}, oneshot}, task::JoinHandle};
 
-use crate::UserAction;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClientId([u8; ClientId::LEN]);
 
@@ -69,24 +67,24 @@ impl ClientId {
 }
 
 /// Struct holding network connections
-pub struct Inputs<W> {
+pub struct Inputs<W, A> {
     pub connman_kill_rx: oneshot::Receiver<()>,
     pub collater_kill_rx: oneshot::Receiver<()>,
     pub parceler_kill_rx: oneshot::Receiver<()>,
-    pub onm_rx: Receiver<(NettingMessage<W>, Option<ClientId>)>,
+    pub onm_rx: Receiver<(NettingMessage<W, A>, Option<ClientId>)>,
     pub osynt_rx: Receiver<OutboundSynapseTransmission>,
     pub death_tally: Arc<AtomicUsize>,
 }
 
-pub struct Outputs<W> {
+pub struct Outputs<W, A> {
     pub osynt_tx: Sender<OutboundSynapseTransmission>,
-    pub inm_tx: Sender<InboundNettingMessage<W>>,
+    pub inm_tx: Sender<InboundNettingMessage<W, A>>,
 }
 
-pub struct Netting<W> {
-    connman: connman::ConnectionManager<W>,
-    collater: collater::Collater<W>,
-    parceler: parceler::Parceler<W>,
+pub struct Netting<W, A> {
+    connman: connman::ConnectionManager<W, A>,
+    collater: collater::Collater<W, A>,
+    parceler: parceler::Parceler<W, A>,
 }
 
 pub struct NettingJoinHandles {
@@ -95,8 +93,8 @@ pub struct NettingJoinHandles {
     parceler: JoinHandle<()>,
 }
 
-impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Netting<W> {
-    pub fn init(inputs: Inputs<W>, outputs: Outputs<W>) -> Self {
+impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static, A: bincode::Decode + bincode::Encode + Debug + Send + 'static> Netting<W, A> {
+    pub fn init(inputs: Inputs<W, A>, outputs: Outputs<W, A>) -> Self {
         let (iknown_tx, iknown_rx) = mpsc::channel(1024);
 
         let collater = collater::Collater::init(collater::Inputs {
@@ -140,12 +138,12 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> Netting<W> 
 }
 
 #[derive(Clone)]
-pub struct NettingApi<W> {
+pub struct NettingApi<W, A> {
     pub osynt_tx: Sender<OutboundSynapseTransmission>,
-    pub onm_tx: Sender<(NettingMessage<W>, Option<ClientId>)>,
+    pub onm_tx: Sender<(NettingMessage<W, A>, Option<ClientId>)>,
 }
 
-impl <W> NettingApi<W> {
+impl <W, A> NettingApi<W, A> {
     // TODO Make this return the client id of the peer.
     pub async fn create_peer_connection(&self, addr: SocketAddr) {
         self.osynt_tx.send(OutboundSynapseTransmission {
@@ -155,19 +153,19 @@ impl <W> NettingApi<W> {
         }).await.expect("no issues sending");
     }
 
-    pub async fn broadcast(&self, msg: NettingMessage<W>) -> Result<(), SendError<(NettingMessage<W>, Option<ClientId>)>> {
+    pub async fn broadcast(&self, msg: NettingMessage<W, A>) -> Result<(), SendError<(NettingMessage<W, A>, Option<ClientId>)>> {
         self.onm_tx.send((msg, None)).await
             .tap_err(|_| trc::warn!("netting broadcast send failed"))
     }
 
-    pub async fn send_to(&self, msg: NettingMessage<W>, peer: ClientId) -> Result<(), SendError<(NettingMessage<W>, Option<ClientId>)>> {
+    pub async fn send_to(&self, msg: NettingMessage<W, A>, peer: ClientId) -> Result<(), SendError<(NettingMessage<W, A>, Option<ClientId>)>> {
         self.onm_tx.send((msg, Some(peer))).await
             .tap_err(|_| trc::warn!("netting send_to send failed"))
     }
 }
 
 #[derive(Debug)]
-pub enum NettingMessageKind<W> {
+pub enum NettingMessageKind<W, A> {
     Noop,
     NakedLogString(String),
     Handshake,
@@ -179,14 +177,14 @@ pub enum NettingMessageKind<W> {
     WorldTransfer(Box<W>),
     WorldSyncStart,
     WorldSyncEnd,
-    User(UserAction),
+    User(A),
     FrameSync(u64),
 }
 
-impl <W: bincode::Decode + bincode::Encode + Debug> NettingMessageKind<W> {
+impl <W: bincode::Decode + bincode::Encode + Debug, A: bincode::Decode + bincode::Encode> NettingMessageKind<W, A> {
     const HANDSHAKE_DISCRIMINANT: u8 = 149;
 
-    pub fn to_msg(self) -> NettingMessage<W> {
+    pub fn into_msg(self) -> NettingMessage<W, A> {
         NettingMessage {
             message_id: Utc::now().timestamp_millis() as u64,
             kind: self,
@@ -210,7 +208,14 @@ impl <W: bincode::Decode + bincode::Encode + Debug> NettingMessageKind<W> {
                 bytes.push(4); // discriminant
                 bytes
             },
-            Self::User(_u) => vec![5],
+            Self::User(ua) => {
+                let mut bytes = bincode::encode_to_vec(
+                    ua,
+                    bincode::config::standard()
+                ).expect("no issues encoding");
+                bytes.push(5);
+                bytes
+            },
             Self::NakedLogString(log_str) => {
                 let mut v = log_str.into_bytes();
                 v.push(6);
@@ -244,7 +249,12 @@ impl <W: bincode::Decode + bincode::Encode + Debug> NettingMessageKind<W> {
                     )
                 ))
             },
-            5 => Ok(Self::User(unimplemented!("wat"))),
+            5 => Ok(Self::User(
+                bincode::decode_from_slice(
+                    bytes.as_slice(),
+                    bincode::config::standard()
+                ).map_err(|_| NettingMessageKindParseError::BadWorld(bytes))?.0
+            )),
             6 => {
                 bytes.pop();
                 Ok(Self::NakedLogString(String::from_utf8(bytes).expect("only string passed")))
@@ -306,12 +316,12 @@ pub enum NettingMessageParseError {
 }
 
 #[derive(Debug)]
-pub struct NettingMessage<W> {
+pub struct NettingMessage<W, A> {
     pub message_id: u64,
-    pub kind: NettingMessageKind<W>,
+    pub kind: NettingMessageKind<W, A>,
 }
 
-impl <W: bincode::Decode + bincode::Encode + Debug> NettingMessage<W> {
+impl <W: bincode::Decode + bincode::Encode + Debug, A: bincode::Decode + bincode::Encode + Debug> NettingMessage<W, A> {
     pub fn into_known_packet_bytes(self) -> Vec<Vec<u8>> {
         let unfettered_bytes = self.kind.into_bytes();
         let common_header: Vec<_> = (unfettered_bytes.len() as u64).to_be_bytes().into_iter()
@@ -386,7 +396,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug> NettingMessage<W> {
         }
     }
 
-    pub fn to_inbound(self, sender_id: ClientId) -> InboundNettingMessage<W> {
+    pub fn to_inbound(self, sender_id: ClientId) -> InboundNettingMessage<W, A> {
         InboundNettingMessage {
             sender_id,
             msg: self,
@@ -395,13 +405,13 @@ impl <W: bincode::Decode + bincode::Encode + Debug> NettingMessage<W> {
 }
 
 #[derive(Debug)]
-pub struct InboundNettingMessage<W> {
+pub struct InboundNettingMessage<W, A> {
     pub sender_id: ClientId,
-    pub msg: NettingMessage<W>,
+    pub msg: NettingMessage<W, A>,
 }
 
-pub enum SocketMessage<W> {
-    Netting(NettingMessage<W>),
+pub enum SocketMessage<W, A> {
+    Netting(NettingMessage<W, A>),
     RecipientRemove(SocketAddr),
     RecipientCreate(SocketAddr),
 }

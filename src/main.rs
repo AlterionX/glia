@@ -19,6 +19,8 @@ use std::{env::args, error::Error, fmt::Display, net::IpAddr, sync::{atomic::{At
 
 use chrono::{DateTime, Duration, TimeDelta, Utc};
 
+use bincode::{Decode, Encode};
+
 use exec::ThreadDeathReporter;
 use render::Render;
 use tokio::{io::{AsyncBufReadExt, BufReader}, sync::{mpsc, oneshot}};
@@ -27,14 +29,15 @@ use crate::{bus::Bus, netting::{Netting, NettingApi, NettingMessageKind}, simula
 
 const TARGET_FPS: u16 = 120;
 
-#[derive(Debug)]
-pub enum UserAction {
+#[derive(Debug, Copy, Clone, Encode, Decode)]
+pub enum UserActionKind {
+    SetColor([f32; 3]),
 }
 
-impl UserAction {
-    fn timestamp(&self) -> DateTime<Utc> {
-        Utc::now()
-    }
+#[derive(Debug, Copy, Clone, Encode, Decode)]
+pub struct UserAction {
+    pub sim_time: u64,
+    pub kind: UserActionKind,
 }
 
 pub enum Input {
@@ -233,6 +236,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
     let (framesync_recv_tx, framesync_recv_rx) = mpsc::channel(1);
     let (request_snapshot_tx, request_snapshot_rx) = mpsc::channel(1);
     let (force_world_reset_tx, force_world_reset_rx) = mpsc::channel(10);
+    let (user_action_tx, user_action_rx) = mpsc::channel(10);
     let sim_running = Arc::new(AtomicBool::new(false));
     // System/Render channels
     let (window_tx, window_rx) = mpsc::channel(10);
@@ -253,7 +257,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
     };
 
     // Systems setup
-    let net = Netting::<World>::init(netting::Inputs {
+    let net = Netting::<World, UserAction>::init(netting::Inputs {
         connman_kill_rx: net_connman_kill_rx,
         collater_kill_rx: net_collater_kill_rx,
         parceler_kill_rx: net_parceler_kill_rx,
@@ -270,20 +274,22 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
         inm_rx,
         death_tally: Arc::clone(&death_tally),
     }, bus::Outputs {
-        request_snapshot_tx,
+        request_snapshot_tx: request_snapshot_tx.clone(),
         force_world_reset_tx,
         force_jump_tx,
         run_state_tx: run_state_tx.clone(),
         framesync_recv_tx,
+        user_action_tx,
         net_api: net_api.clone(),
     });
-    let sim = Simulation::<_, UserAction>::init(simulation::Inputs {
+    let sim = Simulation::<_, UserActionKind, UserAction>::init(simulation::Inputs {
         kill_rx: sim_kill_rx,
         run_state_rx,
         force_jump_rx,
         request_snapshot_rx,
         force_world_reset_rx,
         framesync_recv_rx,
+        user_action_rx,
         net_api: net_api.clone(),
         death_tally: Arc::clone(&death_tally),
     }, simulation::Outputs {
@@ -296,6 +302,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
         kill_rx: renderer_kill_rx,
     }, render::Outputs {
         death_tally: Arc::clone(&death_tally),
+        request_snapshot_tx: request_snapshot_tx.clone(),
     });
     let sys = SystemBus::init(system::Inputs {
         kill_rx: sys_kill_rx,
@@ -368,7 +375,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
                 }
             };
             let msg = line.trim();
-            let Ok(_) = net_api.broadcast(NettingMessageKind::NakedLogString(msg.to_owned()).to_msg()).await else {
+            let Ok(_) = net_api.broadcast(NettingMessageKind::NakedLogString(msg.to_owned()).into_msg()).await else {
                 break;
             };
         }

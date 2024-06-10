@@ -358,20 +358,20 @@ pub struct Inputs {
     pub death_tally: Arc<AtomicUsize>,
 }
 
-pub struct Outputs<W> {
+pub struct Outputs<W, A> {
     socket: UdpSocket,
     own_cid: ClientId,
     own_addr: SocketAddr,
     pub osynt_tx: Sender<OutboundSynapseTransmission>,
     pub iknown_tx: Sender<AttributedInboundBytes>,
-    pub inm_tx: Sender<InboundNettingMessage<W>>,
+    pub inm_tx: Sender<InboundNettingMessage<W, A>>,
 }
 
-impl <W> Outputs<W> {
+impl <W, A> Outputs<W, A> {
     pub fn init(
         osynt_tx: Sender<OutboundSynapseTransmission>,
         iknown_tx: Sender<AttributedInboundBytes>,
-        inm_tx: Sender<InboundNettingMessage<W>>,
+        inm_tx: Sender<InboundNettingMessage<W, A>>,
     ) -> Self {
         let own_cid = ClientId::gen();
         trc::info!("NET-INIT Own Client ID: {own_cid:?}");
@@ -393,7 +393,7 @@ impl <W> Outputs<W> {
     }
 }
 
-pub struct ConnectionManager<W> {
+pub struct ConnectionManager<W, A> {
     poll: Poll,
     events: Events,
 
@@ -401,14 +401,14 @@ pub struct ConnectionManager<W> {
     ack_rx: Receiver<(usize, SocketAddr)>,
 
     inputs: Inputs,
-    outputs: Outputs<W>,
+    outputs: Outputs<W, A>,
 }
 
-impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> ConnectionManager<W> {
+impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static, A: bincode::Decode + bincode::Encode + Debug + Send + 'static> ConnectionManager<W, A> {
     const OWN_PORT_TOPIC: Token = Token(0);
 
     /// This is the root of everything.
-    pub fn init(inputs: Inputs, outputs: Outputs<W>) -> Self {
+    pub fn init(inputs: Inputs, outputs: Outputs<W, A>) -> Self {
         let (ack_tx, ack_rx) = mpsc::channel(512);
 
         Self {
@@ -552,7 +552,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> ConnectionM
                                 trc::warn!("NET-ISYNT-HANDSHAKE-INIT no issues internal propagation");
                                 break 'initiate_end;
                             };
-                            let Ok(_) = self.outputs.inm_tx.send(NettingMessageKind::NewConnection.to_msg().to_inbound(peer_client_id)).await else {
+                            let Ok(_) = self.outputs.inm_tx.send(NettingMessageKind::NewConnection.into_msg().to_inbound(peer_client_id)).await else {
                                 trc::info!("NET-ISYNT-HANDSHAKE-INIT inm_tx");
                                 break 'initiate_end;
                             };
@@ -617,7 +617,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static> ConnectionM
 
                             connection_data.exchanged_key = Some(combined_key);
                             trc::info!("NET-ISYNT-HANDSHAKE-RESP complete");
-                            let Ok(_) = self.outputs.inm_tx.send(NettingMessageKind::NewConnection.to_msg().to_inbound(peer_client_id)).await else {
+                            let Ok(_) = self.outputs.inm_tx.send(NettingMessageKind::NewConnection.into_msg().to_inbound(peer_client_id)).await else {
                                 trc::warn!("NET-ISYNT-HANDSHAKE-RESP no issues sending");
                                 break 'response_end;
                             };

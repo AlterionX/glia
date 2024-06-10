@@ -3,31 +3,36 @@ use std::{collections::{hash_map, HashMap}, fmt::Debug, sync::{atomic::{AtomicBo
 use chrono::{DateTime, Utc};
 use tokio::{task::JoinHandle, sync::{mpsc::{Sender, Receiver}, oneshot}};
 
-use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter}, netting::{ClientId, InboundNettingMessage, NettingApi, NettingMessageKind}, simulation::{SnapshotWorldState, SynchronizedSimulatable}};
+use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter}, netting::{ClientId, InboundNettingMessage, NettingApi, NettingMessageKind}, simulation::{ActionIntake, SnapshotWorldState, SynchronizedSimulatable}};
 
-pub struct Inputs<W> {
+pub struct Inputs<W, A> {
     pub sim_running: Arc<AtomicBool>,
     pub kill_rx: oneshot::Receiver<()>,
-    pub inm_rx: Receiver<InboundNettingMessage<W>>,
+    pub inm_rx: Receiver<InboundNettingMessage<W, A>>,
     pub death_tally: Arc<AtomicUsize>,
 }
 
-pub struct Outputs<W> {
+pub struct Outputs<W, LA, GA> {
     pub request_snapshot_tx: Sender<oneshot::Sender<SnapshotWorldState<W>>>,
     pub force_world_reset_tx: Sender<W>,
     pub force_jump_tx: Sender<Option<(DateTime<Utc>, u64)>>,
     pub run_state_tx: Sender<bool>,
     pub framesync_recv_tx: Sender<(ClientId, u64)>,
-    pub net_api: NettingApi<W>,
+    pub user_action_tx: Sender<ActionIntake<LA, GA>>,
+    pub net_api: NettingApi<W, GA>,
 }
 
-pub struct Bus<W> {
-    inputs: Inputs<W>,
-    outputs: Outputs<W>,
+pub struct Bus<W, LA, GA> {
+    inputs: Inputs<W, GA>,
+    outputs: Outputs<W, LA, GA>,
 }
 
-impl <W: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clone + SynchronizedSimulatable> Bus<W> {
-    pub fn init(inputs: Inputs<W>, outputs: Outputs<W>) -> Self {
+impl <
+    W: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clone + SynchronizedSimulatable,
+    LA: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clone,
+    GA: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clone,
+> Bus<W, LA, GA> {
+    pub fn init(inputs: Inputs<W, GA>, outputs: Outputs<W, LA, GA>) -> Self {
         Bus {
             inputs,
             outputs,
@@ -77,7 +82,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clo
                                     return;
                                 };
                                 let kind = NettingMessageKind::WorldTransfer(Box::new(snapshot.next));
-                                let Ok(_) = stashed_net_api.send_to(kind.to_msg(), inbound_msg.sender_id).await else {
+                                let Ok(_) = stashed_net_api.send_to(kind.into_msg(), inbound_msg.sender_id).await else {
                                     return;
                                 };
                             });
@@ -102,8 +107,8 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clo
                             continue;
                         };
                     },
-                    NettingMessageKind::User(_ua) => {
-                        unimplemented!("not yet able to handle user actions");
+                    NettingMessageKind::User(ua) => {
+                        self.outputs.user_action_tx.send(ActionIntake::Global(ua)).await.expect("rx to still exist");
                     },
                     NettingMessageKind::FrameSync(frame) => {
                         let should_loudly_log = match framesync_records.entry(inbound_msg.sender_id) {

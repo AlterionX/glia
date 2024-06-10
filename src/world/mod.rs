@@ -88,6 +88,9 @@ pub struct World {
     pub generation: u64,
     pub stage: Option<GameStage>,
     pub characters: Vec<Character>,
+
+    // Super temp thing to prove out a concept.
+    pub color: [f32; 3],
 }
 
 impl SynchronizedSimulatable for World {

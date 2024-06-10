@@ -1,12 +1,13 @@
 use std::sync::{atomic::AtomicUsize, Arc};
 
+use chrono::TimeDelta;
 use renderer::{RendererBuilder, RendererPreferences};
 use task::{LightCollection, RenderTask};
-use tokio::{sync::{mpsc::{Receiver, error::TryRecvError}, oneshot}, task::JoinHandle};
+use tokio::{sync::{mpsc::{Sender, Receiver, error::TryRecvError}, oneshot}, task::JoinHandle};
 use vulkano::format::ClearColorValue;
 use winit::window::Window;
 
-use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter}, model::camera::{Camera, OrthoCamera}};
+use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter}, model::camera::{Camera, OrthoCamera}, simulation::SnapshotWorldState, world::World};
 
 // use self::renderer::{Renderer, RendererPreferences};
 
@@ -14,20 +15,15 @@ pub mod task;
 mod renderer;
 mod shaders;
 
-#[derive(Debug, Clone)]
-pub struct SimRenderRequest {
-    pub color: [f32; 3],
-}
-
 pub enum RenderScene {
-    Sim(SimRenderRequest),
+    Sim,
     Menu,
     MainMenu,
 }
 
-pub struct Render {
+pub struct Render<W> {
     inputs: Inputs,
-    outputs: Outputs,
+    outputs: Outputs<W>,
 }
 
 pub struct RenderingTaskHandle {
@@ -40,12 +36,43 @@ pub struct Inputs {
     pub kill_rx: oneshot::Receiver<()>,
 }
 
-pub struct Outputs {
+pub struct Outputs<W> {
     pub death_tally: Arc<AtomicUsize>,
+    pub request_snapshot_tx: Sender<oneshot::Sender<SnapshotWorldState<W>>>,
 }
 
-impl Render {
-    pub fn init(inputs: Inputs, outputs: Outputs) -> Self {
+pub trait Renderable {
+    type Cache<'a>;
+
+    fn into_render_task_with_cache<'a>(self, cache: Self::Cache<'a>) -> RenderTask<'a>;
+}
+
+pub trait RenderableWithoutCache {
+    fn into_render_task(self) -> RenderTask<'static>;
+}
+
+impl <T: Renderable<Cache<'static>=()>> RenderableWithoutCache for T {
+    fn into_render_task(self) -> RenderTask<'static> {
+        self.into_render_task_with_cache(())
+    }
+}
+
+impl Renderable for World {
+    type Cache<'a> = ();
+
+    fn into_render_task_with_cache<'a>(self, _cache: Self::Cache<'a>) -> RenderTask<'a> {
+        RenderTask {
+            draw_wireframe: false,
+            clear_color: ClearColorValue::Float([self.color[0], self.color[1], self.color[2], 1.]),
+            draws: vec![],
+            lights: LightCollection(vec![]),
+            cam: Camera::Orthographic(OrthoCamera::default()),
+        }
+    }
+}
+
+impl <W: Sync + Send + RenderableWithoutCache + 'static> Render<W> {
+    pub fn init(inputs: Inputs, outputs: Outputs<W>) -> Self {
         Self {
             inputs,
             outputs,
@@ -117,15 +144,22 @@ impl Render {
                 // TODO Actually handle the responses.
 
                 let render_task = match initial {
-                    RenderScene::Sim(req) => {
-                        trc::info!("color {:?}", req.color);
-                        RenderTask {
-                            draw_wireframe: false,
-                            clear_color: ClearColorValue::Float([req.color[0], req.color[1], req.color[2], 1.]),
-                            draws: vec![],
-                            lights: LightCollection(vec![]),
-                            cam: &Camera::Orthographic(OrthoCamera::default()),
-                        }
+                    RenderScene::Sim => {
+                        let (world_tx, world_rx) = oneshot::channel();
+                        let Err(_returned_world_tx) = self.outputs.request_snapshot_tx.send_timeout(world_tx, TimeDelta::milliseconds(100).to_std().unwrap()).await else {
+                            window_cache = Some((stashed_gen, window));
+                            renderer_cache = Some(renderer);
+                            continue 'main_loop;
+                        };
+                        let snapshot = match world_rx.await {
+                            Ok(s) => s,
+                            Err(_) => {
+                                window_cache = Some((stashed_gen, window));
+                                renderer_cache = Some(renderer);
+                                continue 'main_loop;
+                            },
+                        };
+                        snapshot.prev.into_render_task()
                     },
                     RenderScene::Menu => {
                         determine_menu_draw_calls()

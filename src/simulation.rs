@@ -1,9 +1,29 @@
 use std::{collections::{HashMap, VecDeque}, fmt::Debug, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}};
 
 use chrono::{DateTime, Utc};
-use tokio::{sync::{mpsc::{Receiver, Sender}, oneshot, RwLock}, task::JoinHandle};
+use tokio::{sync::{mpsc::{Receiver, Sender, error::TryRecvError}, oneshot, RwLock}, task::JoinHandle};
 
-use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter, TimeoutOutcome}, netting::{ClientId, NettingApi, NettingMessageKind}, render::{RenderScene, SimRenderRequest}};
+use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter, TimeoutOutcome}, netting::{ClientId, NettingApi, NettingMessage, NettingMessageKind}, render::RenderScene, UserAction, UserActionKind};
+
+pub enum ActionIntake<LA, GA> {
+    Local(LA),
+    Global(GA),
+}
+
+pub trait GlobalizableAction {
+    type Output;
+    fn globalize(self, timeframe: u64) -> Self::Output;
+}
+
+impl GlobalizableAction for UserActionKind {
+    type Output = UserAction;
+    fn globalize(self, sim_time: u64) -> Self::Output {
+        UserAction {
+            sim_time,
+            kind: self,
+        }
+    }
+}
 
 // TODO use a triple buffer with some network-related niceties
 #[derive(Default)]
@@ -75,7 +95,7 @@ pub struct SnapshotWorldState<W> {
     pub interpolation: f64,
 }
 
-pub struct Inputs<W> {
+pub struct Inputs<W, LA, GA> {
     /// This informs if the simulation should kill itself.
     pub kill_rx: oneshot::Receiver<()>,
     /// This informs the simulation to begin execution or to pause.
@@ -92,8 +112,9 @@ pub struct Inputs<W> {
     /// projected future state, as well as an interpolation percentage on [0., 1.]
     pub request_snapshot_rx: Receiver<oneshot::Sender<SnapshotWorldState<W>>>,
     pub force_world_reset_rx: Receiver<W>,
-    pub net_api: NettingApi<W>,
+    pub net_api: NettingApi<W, GA>,
     pub framesync_recv_rx: Receiver<(ClientId, u64)>,
+    pub user_action_rx: Receiver<ActionIntake<LA, GA>>,
     pub death_tally: Arc<AtomicUsize>,
 }
 
@@ -104,10 +125,11 @@ pub struct Outputs {
     pub draw_call_tx: Sender<RenderScene>,
 }
 
-pub struct Simulation<W, A> {
+pub struct Simulation<W, LA, GA> {
     kill_rx: oneshot::Receiver<()>,
+    user_action_rx: Receiver<ActionIntake<LA, GA>>,
     running: Arc<AtomicBool>,
-    world_stash: WorldStash<W, A>,
+    world_stash: WorldStash<W, GA>,
     framesync: FrameSync,
     run_state_rx: Receiver<bool>,
     force_jump_rx: Receiver<Option<(chrono::DateTime<chrono::Utc>, u64)>>,
@@ -117,13 +139,14 @@ pub struct Simulation<W, A> {
     death_tally: Arc<AtomicUsize>,
     draw_call_tx: Sender<RenderScene>,
 
-    net_api: NettingApi<W>,
+    net_api: NettingApi<W, GA>,
 }
 
-impl <W: Default + Clone, A> Simulation<W, A> {
-    pub fn init(inputs: Inputs<W>, outputs: Outputs) -> Simulation<W, A> {
+impl <W: Default + Clone, LA, GA> Simulation<W, LA, GA> {
+    pub fn init(inputs: Inputs<W, LA, GA>, outputs: Outputs) -> Simulation<W, LA, GA> {
         Simulation {
             kill_rx: inputs.kill_rx,
+            user_action_rx: inputs.user_action_rx,
             running: Arc::clone(&outputs.running),
             world_stash: WorldStash::new(W::default()),
             run_state_rx: inputs.run_state_rx,
@@ -150,14 +173,12 @@ pub struct SimulationHandle {
 
 impl<
     W: SynchronizedSimulatable + Clone + Send + Default + Sync + 'static + Debug + bincode::Encode + bincode::Decode,
-    A: Send + 'static
-> Simulation<W, A> {
+    LA: GlobalizableAction<Output=GA> + Send + 'static,
+    GA: Send + Clone + bincode::Encode + bincode::Decode + 'static,
+> Simulation<W, LA, GA> {
     pub fn start(mut self) -> SimulationHandle {
-        // let actions_since_sync: Vec<UserAction> = vec![];
-        // let worlds_since_sync: Vec<(DateTime<Utc>, World)> = vec![];
-
         let sim_handle = ThreadDeathReporter::new(&self.death_tally, "sim").spawn(async move {
-            loop {
+            'main_loop: loop {
                 if exec::kill_requested(&mut self.kill_rx) { return; }
 
                 self.running.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -171,15 +192,6 @@ impl<
                 // The world loops repeatedly.
                 let mut target_sim_time = Utc::now();
                 loop {
-                    // let network_input_thread = s.spawn(|| loop {
-                    //     if game_complete.load(Ordering::Relaxed) {
-                    //         break;
-                    //     }
-                    //     // Read user input, network events and rearrange them. Also manage periodic sync.
-                    //     // Also ruthlessly kill connections if they haven't been around for a minute. Not
-                    //     // sure how the game world will react to this, though.
-                    // });
-
                     let now = Utc::now();
                     if now < target_sim_time {
                         match self.force_jump_rx.recv_for(target_sim_time - now).await {
@@ -208,13 +220,32 @@ impl<
 
                     let working_world = self.world_stash.peek_most_recent().expect("at least one world to be present").clone();
                     let working_world_generation = working_world.generation();
+                    while let Some(action_intake) = match self.user_action_rx.try_recv() {
+                        Ok(action_intake) => Some(action_intake),
+                        Err(TryRecvError::Empty) => None,
+                        Err(TryRecvError::Disconnected) => {
+                            continue 'main_loop;
+                        },
+                    } {
+                        let action = match action_intake {
+                            ActionIntake::Global(g) => g,
+                            ActionIntake::Local(l) => {
+                                let a = l.globalize(working_world_generation);
+                                self.net_api.broadcast(NettingMessageKind::User(a.clone()).into_msg()).await.expect("no problems broadcasting");
+                                a
+                            },
+                        };
+                        self.world_stash.insert_recent_action(action);
+                    }
+                    // TODO do actions that match the world generation
+
                     let next_working_world = (*working_world).clone().advance();
                     trc::trace!("SIM-LOOP generation={:?}", working_world_generation);
                     // As the last step of each step, stash the world and move on.
                     // TODO force fixed wake up
                     self.world_stash.push_world(next_working_world);
 
-                    let Ok(()) = self.net_api.broadcast(NettingMessageKind::FrameSync(working_world_generation).to_msg()).await else {
+                    let Ok(()) = self.net_api.broadcast(NettingMessageKind::FrameSync(working_world_generation).into_msg()).await else {
                         break;
                     };
                     if let Some(extra_required_delay) = self.framesync.calculate_delay(working_world_generation).await {
@@ -231,15 +262,13 @@ impl<
                     }
 
                     target_sim_time += chrono::TimeDelta::milliseconds(1000 / i64::from(super::TARGET_FPS));
-
                     // This doesn't send the world state in case the render thread is being slow.
-                    // The render thread will filter out
+                    // The render thread will filter out rapid calls and render at whatever is its
+                    // sustainable rate.
                     let temp_channel = self.draw_call_tx.clone();
                     tokio::spawn(async move {
                         // TODO Change this to actual scene render
-                        temp_channel.send(RenderScene::Sim(SimRenderRequest {
-                            color: [1., 1., 1.],
-                        })).await.ok();
+                        temp_channel.send(RenderScene::Sim).await.ok();
                     });
                 }
             }
