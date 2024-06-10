@@ -60,7 +60,7 @@ impl <T: Renderable<Cache<'static>=()>> RenderableWithoutCache for T {
 impl Renderable for World {
     type Cache<'a> = ();
 
-    fn into_render_task_with_cache<'a>(self, _cache: Self::Cache<'a>) -> RenderTask<'a> {
+    fn into_render_task_with_cache(self, _cache: Self::Cache<'_>) -> RenderTask<'_> {
         RenderTask {
             draw_wireframe: false,
             clear_color: ClearColorValue::Float([self.color[0], self.color[1], self.color[2], 1.]),
