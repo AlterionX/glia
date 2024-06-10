@@ -250,7 +250,7 @@ impl RenderTimer {
     fn record_end(self) {
         let over = Instant::now() - self.start;
         let a = 1000. / over.as_millis() as f64;
-        trc::info!("RENDER-PASS-TIMING fps={a} loads={:?} submit={:?} draw={:?} total={:?}", self.loads, self.command_record_duration, self.draw_duration, over);
+        trc::debug!("RENDER-PASS-TIMING fps={a} loads={:?} submit={:?} draw={:?} total={:?}", self.loads, self.command_record_duration, self.draw_duration, over);
     }
 }
 
@@ -1114,7 +1114,7 @@ impl Renderer {
             fn record_end(self) {
                 let over = Instant::now() - self.start;
                 let a = 1000. / over.as_millis() as f64;
-                trc::info!(
+                trc::debug!(
                     "RENDER-PASS-TIMING \
                         fps={a} \
                         swapchain_duration={:?} \
@@ -1155,7 +1155,7 @@ impl Renderer {
             Entry::Occupied(ref mut o) => {
                 let swapchain_information = o.get_mut();
                 if swapchain_information.is_stale_for_window(&window) {
-                    trc::info!("RENDER-PASS-SWAPCHAIN-REGEN");
+                    trc::trace!("RENDER-PASS-SWAPCHAIN-REGEN");
                     self.pipeline_cache = None;
                     swapchain_information.regenerated_swapchain(&window, &self.physical_device, &self.device, &self.device_memory_alloc).unwrap();
                 }
@@ -1164,13 +1164,13 @@ impl Renderer {
         };
         perf.record_swapchain_end();
 
-        trc::info!("RENDER-PASS-INIT");
+        trc::debug!("RENDER-PASS-INIT");
 
         {
             for draw in task.draws.iter() {
                 let mesh_id = draw.mesh.mesh_id;
                 if self.loaded_models.contains_key(&mesh_id) {
-                    trc::info!("RENDER-COPY mesh={mesh_id} already_loaded=true");
+                    trc::trace!("RENDER-COPY mesh={mesh_id} already_loaded=true");
                     continue;
                 }
 
@@ -1180,7 +1180,7 @@ impl Renderer {
                 Self::copy_sized_slice_to_buffer(&self.face_buffer.clone().slice(self.index_free_byte_start..), draw.mesh.ff.as_slice()).unwrap();
                 // We'll assume the image's format is RGB.
                 let (texture_image, texture_descriptor_set) = if let Some(ref file_path) = draw.mesh.tex_file {
-                    trc::info!("RENDER-TEXTURE mesh={mesh_id} texture={file_path:?}");
+                    trc::trace!("RENDER-TEXTURE mesh={mesh_id} texture={file_path:?}");
                     assert!(file_path.ends_with(".png"), "only pngs are handled, and only ARGB pngs");
                     let f = std::fs::File::open(file_path).expect("provided file exists");
                     let texture_file = img::load(std::io::BufReader::new(f), ImageFormat::Png).unwrap().into_rgba32f();
@@ -1267,7 +1267,7 @@ impl Renderer {
                 self.vertex_free_byte_start += vblen;
                 self.index_free_byte_start += fblen;
 
-                trc::info!("RENDER-COPY mesh={mesh_id} vertex_start={} vertex_len={vblen} face_start={} face_len={fblen}", self.vertex_free_byte_start, self.index_free_byte_start);
+                trc::trace!("RENDER-COPY mesh={mesh_id} vertex_start={} vertex_len={vblen} face_start={} face_len={fblen}", self.vertex_free_byte_start, self.index_free_byte_start);
 
                 perf.record_load_end();
             }
@@ -1302,19 +1302,19 @@ impl Renderer {
         let color_attachment_count = subpass.num_color_attachments();
         let pipeline = if let Some(pipeline) = 'pipeline_cache_check: {
             let Some((cached_extent, cached_color_attachment_count, cached_window_id, cached_pipeline)) = self.pipeline_cache.as_ref() else {
-                trc::info!("RENDER-PASS-PIPELINE-CACHE cache_miss reason=no_cache");
+                trc::trace!("RENDER-PASS-PIPELINE-CACHE cache_miss reason=no_cache");
                 break 'pipeline_cache_check None;
             };
             if *cached_extent != active_extent {
-                trc::info!("RENDER-PASS-PIPELINE-CACHE cache_miss reason=extent old={:?} new={:?}", cached_extent, active_extent);
+                trc::trace!("RENDER-PASS-PIPELINE-CACHE cache_miss reason=extent old={:?} new={:?}", cached_extent, active_extent);
                 break 'pipeline_cache_check None;
             }
             if *cached_color_attachment_count != color_attachment_count {
-                trc::info!("RENDER-PASS-PIPELINE-CACHE cache_miss reason=attachment_count old={:?} new={:?}", cached_color_attachment_count, color_attachment_count);
+                trc::trace!("RENDER-PASS-PIPELINE-CACHE cache_miss reason=attachment_count old={:?} new={:?}", cached_color_attachment_count, color_attachment_count);
                 break 'pipeline_cache_check None;
             }
             if *cached_window_id != window.id() {
-                trc::info!("RENDER-PASS-PIPELINE-CACHE cache_miss reason=window_id old={:?} new={:?}", cached_window_id, window.id());
+                trc::trace!("RENDER-PASS-PIPELINE-CACHE cache_miss reason=window_id old={:?} new={:?}", cached_window_id, window.id());
                 break 'pipeline_cache_check None;
             }
             Some(cached_pipeline)
@@ -1420,7 +1420,7 @@ impl Renderer {
                     ..GraphicsPipelineCreateInfo::layout(Arc::clone(&self.pipeline_layout))
                 }
             ).unwrap();
-            trc::info!("RENDER-PASS-PIPELINE descriptor_set={}", pipeline.num_used_descriptor_sets());
+            trc::debug!("RENDER-PASS-PIPELINE descriptor_set={}", pipeline.num_used_descriptor_sets());
             self.pipeline_cache = Some((active_extent, color_attachment_count, window.id(), pipeline.clone()));
             pipeline
         };
@@ -1494,7 +1494,7 @@ impl Renderer {
             let vert_count = draw.mesh.vec_vv.len() as i32;
             let index_count = draw.mesh.ff.len() as u32;
             let instance_count = draw.instancing_information.len() as u32;
-            trc::info!(
+            trc::trace!(
                 "RENDER-PASS-DRAW vertex_start={} vertex_count={vert_count} index_start={} index_count={index_count} instance_start={current_instance_buffer_idx} instance_count={instance_count}",
                 handle.vertex_offset,
                 handle.index_offset,
@@ -1523,7 +1523,7 @@ impl Renderer {
                     )
             }.unwrap();
             current_instance_buffer_idx += instance_count;
-            trc::info!("RENDER-PASS-DRAW-COMPLETE");
+            trc::trace!("RENDER-PASS-DRAW-COMPLETE");
         }
         builder
             .end_render_pass(SubpassEndInfo { ..Default::default() })
@@ -1545,7 +1545,7 @@ impl Renderer {
         perf.record_draw_end();
 
         perf.record_end();
-        trc::info!("RENDER-PASS-COMPLETE");
+        trc::debug!("RENDER-PASS-COMPLETE");
 
         Ok(())
     }

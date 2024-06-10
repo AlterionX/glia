@@ -73,6 +73,11 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static, A: bincode:
                         trc::error!("corrupted world sent across the wire {:?}", base64::encode(world));
                         None
                     },
+                    Err(NettingMessageParseError::BadUserAction(world)) => {
+                        // TODO Hexencode
+                        trc::error!("corrupted user action sent across the wire {:?}", base64::encode(world));
+                        None
+                    },
                 };
                 if let Some(msg) = opt_msg {
                     // If we couldn't load a message, we're done with the current message. Pop it

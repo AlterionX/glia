@@ -146,14 +146,15 @@ impl <W: Sync + Send + RenderableWithoutCache + 'static> Render<W> {
                 let render_task = match initial {
                     RenderScene::Sim => {
                         let (world_tx, world_rx) = oneshot::channel();
-                        let Err(_returned_world_tx) = self.outputs.request_snapshot_tx.send_timeout(world_tx, TimeDelta::milliseconds(100).to_std().unwrap()).await else {
+                        let Ok(_) = self.outputs.request_snapshot_tx.send_timeout(world_tx, TimeDelta::milliseconds(100).to_std().unwrap()).await else {
                             window_cache = Some((stashed_gen, window));
                             renderer_cache = Some(renderer);
                             continue 'main_loop;
                         };
                         let snapshot = match world_rx.await {
                             Ok(s) => s,
-                            Err(_) => {
+                            Err(e) => {
+                                trc::error!("WTFFFFF {e:?}");
                                 window_cache = Some((stashed_gen, window));
                                 renderer_cache = Some(renderer);
                                 continue 'main_loop;

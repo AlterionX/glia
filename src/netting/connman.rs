@@ -360,7 +360,7 @@ pub struct Inputs {
 
 pub struct Outputs<W, A> {
     socket: UdpSocket,
-    own_cid: ClientId,
+    pub own_cid: ClientId,
     own_addr: SocketAddr,
     pub osynt_tx: Sender<OutboundSynapseTransmission>,
     pub iknown_tx: Sender<AttributedInboundBytes>,
@@ -553,7 +553,6 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static, A: bincode:
                                 break 'initiate_end;
                             };
                             let Ok(_) = self.outputs.inm_tx.send(NettingMessageKind::NewConnection.into_msg().to_inbound(peer_client_id)).await else {
-                                trc::info!("NET-ISYNT-HANDSHAKE-INIT inm_tx");
                                 break 'initiate_end;
                             };
                         },
@@ -616,7 +615,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static, A: bincode:
                             };
 
                             connection_data.exchanged_key = Some(combined_key);
-                            trc::info!("NET-ISYNT-HANDSHAKE-RESP complete");
+                            trc::trace!("NET-ISYNT-HANDSHAKE-RESP complete");
                             let Ok(_) = self.outputs.inm_tx.send(NettingMessageKind::NewConnection.into_msg().to_inbound(peer_client_id)).await else {
                                 trc::warn!("NET-ISYNT-HANDSHAKE-RESP no issues sending");
                                 break 'response_end;
@@ -630,11 +629,11 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static, A: bincode:
                         SynapseTransmissionKind::PeerDiscovery => unimplemented!("peer connection not yet working"),
                         SynapseTransmissionKind::Ack => 'ack_end: {
                             let Some(connection_data) = connections.addr_get_mut(sender_addr) else {
-                                trc::info!("NET-ISYNT-ACK ignoring ack");
+                                trc::debug!("NET-ISYNT-ACK ignoring ack");
                                 // We have not initiated this connection yet, this is a bad request.
                                 break 'ack_end;
                             };
-                            trc::info!("NET-ISYNT-ACK tx_no={:?}", isynt.transmission_number);
+                            trc::trace!("NET-ISYNT-ACK tx_no={:?}", isynt.transmission_number);
                             connection_data.active_messages[isynt.transmission_number].0 = 0;
                         },
                         SynapseTransmissionKind::KnownPacket => 'known_packet_end: {
@@ -676,7 +675,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static, A: bincode:
 
                 if writable { 'writer_blk: {
                     while let Ok((tx_no, addr)) = self.ack_rx.try_recv() {
-                        trc::info!("NET-WRITE sending ack {tx_no:?} to {addr:?}");
+                        trc::trace!("NET-WRITE sending ack {tx_no:?} to {addr:?}");
                         self.outputs.socket.send_to(&[
                             OutboundSynapseTransmissionKind::Ack { transmission_number: tx_no }.to_discriminant(),
                             tx_no as u8
@@ -747,7 +746,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static, A: bincode:
                             let own_private = EncodedPoint::from(own_secret.public_key());
                             let own_public = PublicKey::from_sec1_bytes(own_private.as_ref()).unwrap();
                             connection_data.exchanged_key = Some(PeerKey::Inflight(own_secret));
-                            trc::info!("NET-OSYNT-HANDSHAKE-INIT complete!");
+                            trc::trace!("NET-OSYNT-HANDSHAKE-INIT complete!");
                             // TODO sign these bytes
                             let greeting_bytes =
                                 HANDSHAKE_GREETING.iter().copied()
@@ -757,7 +756,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static, A: bincode:
                             (false, greeting_bytes, Some(target_addr))
                         },
                         OutboundSynapseTransmissionKind::HandshakeResponse => {
-                            trc::info!("NET-OSYNT-HANDSHAKE-RESP sending");
+                            trc::trace!("NET-OSYNT-HANDSHAKE-RESP sending");
                             (false, osynt.bytes, None)
                         },
                         OutboundSynapseTransmissionKind::Ack { .. } => {
@@ -785,6 +784,12 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static, A: bincode:
                 }
             }
         })
+    }
+}
+
+impl <W, A> ConnectionManager<W, A> {
+    pub fn own_client_id(&self) -> ClientId {
+        self.outputs.own_cid
     }
 }
 

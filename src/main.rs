@@ -15,14 +15,16 @@ mod model;
 // Actual game modules.
 mod world;
 
-use std::{env::args, error::Error, fmt::Display, net::IpAddr, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}};
+use std::{env::args, error::Error, fmt::Display, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}};
 
-use chrono::{DateTime, Duration, TimeDelta, Utc};
+use chrono::TimeDelta;
 
 use bincode::{Decode, Encode};
 
 use exec::ThreadDeathReporter;
+use netting::ClientId;
 use render::Render;
+use simulation::ActionIntake;
 use tokio::{io::{AsyncBufReadExt, BufReader}, sync::{mpsc, oneshot}};
 
 use crate::{bus::Bus, netting::{Netting, NettingApi, NettingMessageKind}, simulation::Simulation, system::SystemBus, world::World};
@@ -34,51 +36,22 @@ pub enum UserActionKind {
     SetColor([f32; 3]),
 }
 
+impl UserActionKind {
+    pub fn should_broadcast(&self) -> bool {
+        match self {
+            Self::SetColor(_) => true,
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, Encode, Decode)]
 pub struct UserAction {
     pub sim_time: u64,
+    pub sender: ClientId,
     pub kind: UserActionKind,
 }
 
 pub enum Input {
-}
-
-pub enum ControlFlow {
-    Continue,
-    RoundComplete,
-    GameComplete,
-}
-
-impl World {
-    fn execute(&mut self, action: UserAction) {
-    }
-
-    /// Action
-    fn tick(&mut self) -> ControlFlow {
-        ControlFlow::Continue
-    }
-
-    /// Determines if the world requires additional input.
-    fn waiting_for_input(&self) -> bool {
-        false
-    }
-}
-
-pub struct Connection {
-    pub last_sync_generation: u64,
-    pub last_sync: DateTime<Utc>,
-    pub socket: (),
-}
-
-impl Connection {
-    pub fn link_to(target_ip: IpAddr, socket: u16, frozen_world: World) -> Self {
-        let a = Self {
-            last_sync: Utc::now(),
-            last_sync_generation: frozen_world.generation,
-            socket: (),
-        };
-        a
-    }
 }
 
 pub enum Change {
@@ -102,7 +75,7 @@ pub enum Interpolation<'a> {
     Transition(Transition<'a>),
     // second field is remaining duration -- this will be passed to the next invocation of
     // deduce_transition.
-    CheckpointReached(&'a World, Duration),
+    CheckpointReached(&'a World, TimeDelta),
 }
 
 pub enum RenderSource<'a> {
@@ -114,10 +87,10 @@ impl<'a> Interpolation<'a> {
     // Returns nothing when we've gone past w1. If this returns None, the rendering code should
     // pass along the next world to render -- or simply render the world as is.
     // TODO Make time_since_w0 actually matter -- it's currently a fixed world rendering strategy.
-    pub fn deduce_transition(w0: &'a World, w1: &'a World, time_since_w0: Duration) -> Self {
+    pub fn deduce_transition(w0: &'a World, w1: &'a World, time_since_w0: TimeDelta) -> Self {
         // Target is 60 fps but each world iteration is potentially long lasting. Aim half second
         // delay for now. The world diff will inform additional information here.
-        if time_since_w0 > Duration::milliseconds(1000/60) {
+        if time_since_w0 > TimeDelta::milliseconds(1000/60) {
             return Self::CheckpointReached(w1, time_since_w0);
         }
         Self::Transition(Transition {
@@ -137,8 +110,8 @@ impl<'a> Interpolation<'a> {
         }
     }
 
-    pub fn into_render_source(worlds: &'a [World], duration_since_initial: Duration) -> Option<RenderSource<'a>> {
-        if worlds.len() == 0 {
+    pub fn into_render_source(worlds: &'a [World], duration_since_initial: TimeDelta) -> Option<RenderSource<'a>> {
+        if worlds.is_empty() {
             return None;
         }
         if worlds.len() == 1 {
@@ -162,19 +135,6 @@ impl<'a> Interpolation<'a> {
                 }
             }
         }
-    }
-}
-
-pub struct Renderer {
-}
-
-impl Renderer {
-    /// This renders the state of the game world transitioning from one to the next.
-    /// We do some hacky stuff to get animations to work correctly -- by analyzing
-    /// diff between the states, we know what animations to play. A side effect of
-    /// this is that "skipping" animations becomes really easy -- we simply render
-    /// the next state without the diffing step.
-    pub fn render(transition: Transition) {
     }
 }
 
@@ -233,7 +193,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
     // Simulation/Bus channels
     let (run_state_tx, run_state_rx) = mpsc::channel(10);
     let (force_jump_tx, force_jump_rx) = mpsc::channel(10);
-    let (framesync_recv_tx, framesync_recv_rx) = mpsc::channel(1);
+    let (framesync_recv_tx, framesync_recv_rx) = mpsc::channel(100);
     let (request_snapshot_tx, request_snapshot_rx) = mpsc::channel(1);
     let (force_world_reset_tx, force_world_reset_rx) = mpsc::channel(10);
     let (user_action_tx, user_action_rx) = mpsc::channel(10);
@@ -279,8 +239,8 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
         force_jump_tx,
         run_state_tx: run_state_tx.clone(),
         framesync_recv_tx,
-        user_action_tx,
         net_api: net_api.clone(),
+        user_action_tx: user_action_tx.clone(),
     });
     let sim = Simulation::<_, UserActionKind, UserAction>::init(simulation::Inputs {
         kill_rx: sim_kill_rx,
@@ -291,6 +251,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
         framesync_recv_rx,
         user_action_rx,
         net_api: net_api.clone(),
+        own_client_id: net.own_client_id(),
         death_tally: Arc::clone(&death_tally),
     }, simulation::Outputs {
         running: Arc::clone(&sim_running),
@@ -327,39 +288,46 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
 
         // We're running some tests for connecting, need to input thing.
         println!("Connect to? (Do not connect on both clients. Hit enter once connected to proceed to message sending.)");
-        let line = loop {
-            tokio::select! {
-                _ = tokio::time::sleep(chrono::Duration::milliseconds(100).to_std().unwrap()) => {
-                    if exec::kill_requested(&mut tio_kill_rx) { return; }
-                },
-                read_line = lines.next_line() => match read_line {
-                    Ok(Some(l)) => {
-                        break l;
-                    },
-                    Ok(None) => {},
-                    Err(_) => {
-                        trc::warn!("can't read stdin");
-                        return;
-                    },
+        'connection_setup: {
+            let line = loop {
+                if sim_running.load(std::sync::atomic::Ordering::Relaxed) {
+                    println!("Connection complete.");
+                    break 'connection_setup;
                 }
+                tokio::select! {
+                    _ = tokio::time::sleep(TimeDelta::milliseconds(100).to_std().unwrap()) => {
+                        if exec::kill_requested(&mut tio_kill_rx) { return; }
+                    },
+                    read_line = lines.next_line() => match read_line {
+                        Ok(Some(l)) => {
+                            break l;
+                        },
+                        Ok(None) => {},
+                        Err(_) => {
+                            trc::warn!("can't read stdin");
+                            return;
+                        },
+                    }
+                }
+            };
+            let addr = line.trim();
+            if sim_running.load(std::sync::atomic::Ordering::Acquire) {
+                println!("Already connected... skipping connection.");
+                trc::info!("Skipping peer -- already connected to mesh");
+            } else {
+                println!("Will attempt to connect to {addr:?}...");
+                // Also initiate game state
+                // TODO resolve race condition of multiple connections
+                run_state_tx.send(true).await.expect("no problems kicking off game loop");
+                net_api.create_peer_connection(addr.parse().unwrap()).await;
             }
-        };
-        let addr = line.trim();
-        println!("Will attempt to connect to {addr:?}...");
-        if sim_running.load(std::sync::atomic::Ordering::Acquire) {
-            trc::info!("Skipping peer -- already connected to mesh");
-        } else {
-            // Also initiate game state
-            // TODO resolve race condition of multiple connections
-            run_state_tx.send(true).await.expect("no problems kicking off game loop");
-            net_api.create_peer_connection(addr.parse().unwrap()).await;
         }
 
         'main_loop: loop {
-            println!("Enter string to send");
+            println!("Enter string to send (blue, red, green, black, white will change colors)");
             let line = loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(chrono::Duration::milliseconds(100).to_std().unwrap()) => {
+                    _ = tokio::time::sleep(TimeDelta::milliseconds(100).to_std().unwrap()) => {
                         if exec::kill_requested(&mut tio_kill_rx) { break 'main_loop; }
                     },
                     read_line = lines.next_line() => match read_line {
@@ -374,10 +342,28 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
                     }
                 }
             };
-            let msg = line.trim();
-            let Ok(_) = net_api.broadcast(NettingMessageKind::NakedLogString(msg.to_owned()).into_msg()).await else {
+            if (match line.trim() {
+                "white" => {
+                    user_action_tx.send(ActionIntake::Local(UserActionKind::SetColor([1., 1., 1.]))).await.ok()
+                },
+                "black" => {
+                    user_action_tx.send(ActionIntake::Local(UserActionKind::SetColor([0., 0., 0.]))).await.ok()
+                },
+                "red" => {
+                    user_action_tx.send(ActionIntake::Local(UserActionKind::SetColor([1., 0., 0.]))).await.ok()
+                },
+                "green" => {
+                    user_action_tx.send(ActionIntake::Local(UserActionKind::SetColor([0., 1., 0.]))).await.ok()
+                },
+                "blue" => {
+                    user_action_tx.send(ActionIntake::Local(UserActionKind::SetColor([0., 0., 1.]))).await.ok()
+                },
+                msg => {
+                    net_api.broadcast(NettingMessageKind::NakedLogString(msg.to_owned()).into_msg()).await.ok()
+                },
+            }).is_none() {
                 break;
-            };
+            }
         }
     });
 

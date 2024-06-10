@@ -1,8 +1,7 @@
 use std::collections::VecDeque;
 
 use bincode::{Decode, Encode};
-
-use crate::simulation::SynchronizedSimulatable;
+use crate::{simulation::SynchronizedSimulatable, UserAction, UserActionKind};
 
 #[derive(Debug, Default, Clone, Encode, Decode)]
 pub enum Terrain {
@@ -93,7 +92,16 @@ pub struct World {
     pub color: [f32; 3],
 }
 
-impl SynchronizedSimulatable for World {
+impl SynchronizedSimulatable<UserAction> for World {
+    fn execute(&mut self, action: &UserAction) {
+        trc::info!("UserAction triggered {action:?}");
+        match action.kind {
+            UserActionKind::SetColor(rgb_f32) => {
+                self.color = rgb_f32;
+            },
+        }
+    }
+
     fn advance(self) -> Self {
         Self {
             generation: self.generation + 1,

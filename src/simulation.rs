@@ -5,6 +5,7 @@ use tokio::{sync::{mpsc::{Receiver, Sender, error::TryRecvError}, oneshot, RwLoc
 
 use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter, TimeoutOutcome}, netting::{ClientId, NettingApi, NettingMessage, NettingMessageKind}, render::RenderScene, UserAction, UserActionKind};
 
+// TODO Fundamentally refactor action flow so that this isn't necessary.
 pub enum ActionIntake<LA, GA> {
     Local(LA),
     Global(GA),
@@ -12,16 +13,31 @@ pub enum ActionIntake<LA, GA> {
 
 pub trait GlobalizableAction {
     type Output;
-    fn globalize(self, timeframe: u64) -> Self::Output;
+    fn globalize(self, timeframe: u64, sender: ClientId) -> Self::Output;
 }
 
 impl GlobalizableAction for UserActionKind {
     type Output = UserAction;
-    fn globalize(self, sim_time: u64) -> Self::Output {
+    fn globalize(self, sim_time: u64, sender: ClientId) -> Self::Output {
         UserAction {
             sim_time,
+            sender,
             kind: self,
         }
+    }
+}
+
+pub trait SimulationTimeframeAttached {
+    fn rank_key(&self) -> (u64, ClientId);
+    fn timeframe(&self) -> u64;
+}
+
+impl SimulationTimeframeAttached for UserAction {
+    fn rank_key(&self) -> (u64, ClientId) {
+        (self.sim_time, self.sender)
+    }
+    fn timeframe(&self) -> u64 {
+        self.sim_time
     }
 }
 
@@ -30,11 +46,12 @@ impl GlobalizableAction for UserActionKind {
 pub struct WorldStash<W, A> {
     historical_actions: VecDeque<A>,
     historical_worlds: VecDeque<Arc<W>>,
+    max_generation: u64,
 }
 
-impl <W: Clone, A> WorldStash<W, A> {
-    // Keep 1 second of world data.
-    const MAX_HISTORY: usize = 100;
+impl <W: Clone + SynchronizedSimulatable<A>, A: SimulationTimeframeAttached> WorldStash<W, A> {
+    // Keep 3 seconds of world data.
+    const MAX_HISTORY: usize = 300;
 
     fn push_world(&mut self, world: W) {
         // 3's kind of arbitrary marker for "much more than one so that a while loop is too
@@ -46,27 +63,68 @@ impl <W: Clone, A> WorldStash<W, A> {
         while self.historical_worlds.len() >= Self::MAX_HISTORY {
             self.historical_worlds.pop_front();
         }
+        let earliest_gen = self.historical_worlds.front().unwrap().generation();
+        while let Some(a) = self.historical_actions.front() {
+            if a.timeframe() >= earliest_gen {
+                break;
+            }
+            self.historical_actions.pop_front();
+        }
         // TODO Drop old user actions that occurred prior to end of world.
 
+        self.max_generation = self.max_generation.max(world.generation());
         // finally stash the new world.
         self.historical_worlds.push_back(world.into());
     }
 
     fn new(world: W) -> Self {
         Self {
+            max_generation: world.generation(),
             historical_worlds: [world.into()].into(),
             historical_actions: VecDeque::with_capacity(Self::MAX_HISTORY),
         }
     }
 
     fn force_reset(&mut self, world: W) {
+        self.max_generation = world.generation();
         self.historical_worlds.clear();
         self.historical_actions.clear();
         self.historical_worlds.push_back(world.into());
     }
 
-    fn insert_recent_action(&mut self, _action: A) {
-        unimplemented!("booo");
+    fn insert_recent_action(&mut self, action: A) {
+        if let Some(w) = self.peek_earliest() {
+            // If the action is past the earliest generation, ignore it. We keep a large enough
+            // buffer that it should be enough (O(seconds)) so anything before that is probably
+            // a bad packet. If it still desyncs, move on.
+            if w.generation() > action.timeframe() {
+                return;
+            }
+        }
+
+        let recalculation_start = action.timeframe();
+        self.historical_actions.push_back(action);
+        self.historical_actions.make_contiguous().sort_by_key(|a| a.rank_key());
+
+        // We will need to recalculate all the worlds prior to this point so, time to drop worlds
+        // until we're good.
+        while let Some(w) = self.peek_most_recent_not_last() {
+            if w.generation() <= recalculation_start {
+                break;
+            }
+            self.historical_worlds.pop_back();
+        }
+    }
+
+    fn peek_earliest(&self) -> Option<Arc<W>> {
+        self.historical_worlds.front().cloned()
+    }
+
+    fn peek_most_recent_not_last(&self) -> Option<Arc<W>> {
+        if self.historical_worlds.len() == 1 {
+            return None;
+        }
+        self.peek_most_recent()
     }
 
     fn peek_most_recent(&self) -> Option<Arc<W>> {
@@ -85,6 +143,14 @@ impl <W: Clone, A> WorldStash<W, A> {
             // TODO Actually select interpolation factor.
             interpolation: 0.
         }
+    }
+
+    fn generation(&self) -> u64 {
+        self.peek_earliest().map(|w| w.generation()).unwrap_or(0)
+    }
+
+    fn actions_for_generation(&self, gen: u64) -> impl Iterator<Item=&A> {
+        self.historical_actions.iter().filter(move |a| a.timeframe() == gen)
     }
 }
 
@@ -116,6 +182,7 @@ pub struct Inputs<W, LA, GA> {
     pub framesync_recv_rx: Receiver<(ClientId, u64)>,
     pub user_action_rx: Receiver<ActionIntake<LA, GA>>,
     pub death_tally: Arc<AtomicUsize>,
+    pub own_client_id: ClientId,
 }
 
 #[derive(Clone)]
@@ -126,6 +193,7 @@ pub struct Outputs {
 }
 
 pub struct Simulation<W, LA, GA> {
+    own_client_id: ClientId,
     kill_rx: oneshot::Receiver<()>,
     user_action_rx: Receiver<ActionIntake<LA, GA>>,
     running: Arc<AtomicBool>,
@@ -142,9 +210,10 @@ pub struct Simulation<W, LA, GA> {
     net_api: NettingApi<W, GA>,
 }
 
-impl <W: Default + Clone, LA, GA> Simulation<W, LA, GA> {
+impl <W: Default + Clone + SynchronizedSimulatable<GA>, LA, GA: SimulationTimeframeAttached> Simulation<W, LA, GA> {
     pub fn init(inputs: Inputs<W, LA, GA>, outputs: Outputs) -> Simulation<W, LA, GA> {
         Simulation {
+            own_client_id: inputs.own_client_id,
             kill_rx: inputs.kill_rx,
             user_action_rx: inputs.user_action_rx,
             running: Arc::clone(&outputs.running),
@@ -162,7 +231,8 @@ impl <W: Default + Clone, LA, GA> Simulation<W, LA, GA> {
     }
 }
 
-pub trait SynchronizedSimulatable {
+pub trait SynchronizedSimulatable<A> {
+    fn execute(&mut self, user_action: &A);
     fn generation(&self) -> u64;
     fn advance(self) -> Self;
 }
@@ -172,9 +242,9 @@ pub struct SimulationHandle {
 }
 
 impl<
-    W: SynchronizedSimulatable + Clone + Send + Default + Sync + 'static + Debug + bincode::Encode + bincode::Decode,
-    LA: GlobalizableAction<Output=GA> + Send + 'static,
-    GA: Send + Clone + bincode::Encode + bincode::Decode + 'static,
+    W: SynchronizedSimulatable<GA> + Clone + Send + Default + Sync + 'static + Debug + bincode::Encode + bincode::Decode,
+    LA: Debug + GlobalizableAction<Output=GA> + Send + 'static,
+    GA: Debug + Send + Clone + bincode::Encode + bincode::Decode + SimulationTimeframeAttached + 'static,
 > Simulation<W, LA, GA> {
     pub fn start(mut self) -> SimulationHandle {
         let sim_handle = ThreadDeathReporter::new(&self.death_tally, "sim").spawn(async move {
@@ -218,32 +288,40 @@ impl<
                         self.framesync.record_framesync(client_id, frame);
                     }
 
-                    let working_world = self.world_stash.peek_most_recent().expect("at least one world to be present").clone();
-                    let working_world_generation = working_world.generation();
+                    let apparent_generation = self.world_stash.max_generation;
                     while let Some(action_intake) = match self.user_action_rx.try_recv() {
                         Ok(action_intake) => Some(action_intake),
                         Err(TryRecvError::Empty) => None,
                         Err(TryRecvError::Disconnected) => {
+                            trc::error!("ACTION-INTAKE-DISCONNECT");
                             continue 'main_loop;
                         },
                     } {
                         let action = match action_intake {
                             ActionIntake::Global(g) => g,
                             ActionIntake::Local(l) => {
-                                let a = l.globalize(working_world_generation);
-                                self.net_api.broadcast(NettingMessageKind::User(a.clone()).into_msg()).await.expect("no problems broadcasting");
+                                let a = l.globalize(apparent_generation, self.own_client_id);
+                                let secondary_a = a.clone();
+                                let net_api = self.net_api.clone();
+                                tokio::spawn(async move {
+                                    net_api.broadcast(NettingMessageKind::User(secondary_a).into_msg()).await.expect("no problems broadcasting");
+                                });
                                 a
                             },
                         };
                         self.world_stash.insert_recent_action(action);
                     }
-                    // TODO do actions that match the world generation
 
-                    let next_working_world = (*working_world).clone().advance();
+                    let mut working_world = (*self.world_stash.peek_most_recent().expect("at least one world to be present")).clone().advance();
+                    let working_world_generation = working_world.generation();
+                    for action in self.world_stash.actions_for_generation(working_world_generation - 1) {
+                        working_world.execute(action);
+                    }
+
                     trc::trace!("SIM-LOOP generation={:?}", working_world_generation);
                     // As the last step of each step, stash the world and move on.
                     // TODO force fixed wake up
-                    self.world_stash.push_world(next_working_world);
+                    self.world_stash.push_world(working_world);
 
                     let Ok(()) = self.net_api.broadcast(NettingMessageKind::FrameSync(working_world_generation).into_msg()).await else {
                         break;
@@ -256,9 +334,9 @@ impl<
                     while let Ok(snapshot_request) = self.request_snapshot_rx.try_recv() {
                         // TODO Determine if we're inbetween frames in the future and properly
                         // calculate frame time offset.
-                        let Ok(_) = snapshot_request.send(snapshot.get_or_insert_with(|| self.world_stash.snapshot()).clone()) else {
-                            break;
-                        };
+
+                        // We're kinda fine with this since if the other side closed, it's fine.
+                        snapshot_request.send(snapshot.get_or_insert_with(|| self.world_stash.snapshot()).clone()).ok();
                     }
 
                     target_sim_time += chrono::TimeDelta::milliseconds(1000 / i64::from(super::TARGET_FPS));
@@ -396,7 +474,7 @@ impl FrameSync {
     async fn signed_distance(&self, position: u64, input: u64) -> Option<(bool, i64)> {
         let r = self.get_ranges(position).await;
         let distance = r.signed_distance(input);
-        trc::info!("FRAMESYNC-SIGNED-DISTANCE position={position:?} input={input:?}");
+        trc::trace!("FRAMESYNC-SIGNED-DISTANCE position={position:?} input={input:?}");
         if !(-Self::VALIDITY_WINDOW_LOWER_DISTANCE..=Self::VALIDITY_WINDOW_UPPER_DISTANCE).contains(&distance) {
             return None;
         }

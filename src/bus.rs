@@ -28,7 +28,7 @@ pub struct Bus<W, LA, GA> {
 }
 
 impl <
-    W: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clone + SynchronizedSimulatable,
+    W: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clone + SynchronizedSimulatable<GA>,
     LA: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clone,
     GA: bincode::Decode + bincode::Encode + Debug + Sync + Send + 'static + Clone,
 > Bus<W, LA, GA> {
@@ -108,6 +108,7 @@ impl <
                         };
                     },
                     NettingMessageKind::User(ua) => {
+                        trc::info!("NM-UATX [{:?}] transfering action {:?} ...", msg.message_id, ua);
                         self.outputs.user_action_tx.send(ActionIntake::Global(ua)).await.expect("rx to still exist");
                     },
                     NettingMessageKind::FrameSync(frame) => {
@@ -118,7 +119,7 @@ impl <
                                     continue;
                                 }
                                 // We're going to try to regulate the log to once per second
-                                let is_big_jump = *b.get() > frame + u64::from(super::TARGET_FPS);
+                                let is_big_jump = *b.get() > frame + u64::from(super::TARGET_FPS * 5);
                                 b.insert(frame);
                                 is_big_jump
                             }
@@ -135,6 +136,7 @@ impl <
                         let Ok(_) = self.outputs.framesync_recv_tx.send((inbound_msg.sender_id, frame)).await else {
                             continue;
                         };
+                        trc::trace!("NM-FSYNC-DONE");
                     },
                 }
                 drop(entered);

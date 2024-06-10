@@ -5,12 +5,13 @@ mod parceler;
 use std::{fmt::Debug, net::SocketAddr, sync::{atomic::AtomicUsize, Arc}};
 
 use chrono::Utc;
+use bincode::{Decode, Encode};
 use derivative::Derivative;
 use mio::net::UdpSocket;
 use tap::TapFallible;
 use tokio::{sync::{mpsc::{self, Receiver, Sender, error::SendError}, oneshot}, task::JoinHandle};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct ClientId([u8; ClientId::LEN]);
 
 impl ClientId {
@@ -137,6 +138,12 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static, A: bincode:
     }
 }
 
+impl <W, A> Netting<W, A> {
+    pub fn own_client_id(&self) -> ClientId {
+        self.connman.own_client_id()
+    }
+}
+
 #[derive(Clone)]
 pub struct NettingApi<W, A> {
     pub osynt_tx: Sender<OutboundSynapseTransmission>,
@@ -181,7 +188,7 @@ pub enum NettingMessageKind<W, A> {
     FrameSync(u64),
 }
 
-impl <W: bincode::Decode + bincode::Encode + Debug, A: bincode::Decode + bincode::Encode> NettingMessageKind<W, A> {
+impl <W: bincode::Decode + bincode::Encode + Debug, A: bincode::Decode + bincode::Encode + Debug> NettingMessageKind<W, A> {
     const HANDSHAKE_DISCRIMINANT: u8 = 149;
 
     pub fn into_msg(self) -> NettingMessage<W, A> {
@@ -199,16 +206,17 @@ impl <W: bincode::Decode + bincode::Encode + Debug, A: bincode::Decode + bincode
             Self::NewConnection => vec![2],
             Self::DroppedConnection { client_id: _ } => vec![3],
             Self::WorldTransfer(w) => {
-                trc::debug!("NET-NM-ENCODE-WTX world: {:?}", w);
+                trc::info!("NET-NM-ENCODE-WTX world: {:?}", w);
                 let mut bytes = bincode::encode_to_vec(
                     w,
                     bincode::config::standard()
                 ).expect("no issues encoding");
-                trc::debug!("NET-NM-ENCODE-WTX bytes: {:?}", bytes);
+                trc::trace!("NET-NM-ENCODE-WTX bytes: {:?}", bytes);
                 bytes.push(4); // discriminant
                 bytes
             },
             Self::User(ua) => {
+                trc::info!("NET-NM-ENCODE-UATX action: {ua:?}");
                 let mut bytes = bincode::encode_to_vec(
                     ua,
                     bincode::config::standard()
@@ -240,21 +248,21 @@ impl <W: bincode::Decode + bincode::Encode + Debug, A: bincode::Decode + bincode
             2 => Ok(Self::NewConnection),
             3 => Ok(Self::DroppedConnection { client_id: ClientId(bytes.try_into().unwrap()) }),
             4 => {
-                Ok(Self::WorldTransfer(
-                    Box::new(
-                        bincode::decode_from_slice(
-                            bytes.as_slice(),
-                            bincode::config::standard()
-                        ).map_err(|_| NettingMessageKindParseError::BadWorld(bytes))?.0
-                    )
-                ))
-            },
-            5 => Ok(Self::User(
-                bincode::decode_from_slice(
+                let w = bincode::decode_from_slice(
                     bytes.as_slice(),
                     bincode::config::standard()
-                ).map_err(|_| NettingMessageKindParseError::BadWorld(bytes))?.0
-            )),
+                ).map_err(|_| NettingMessageKindParseError::BadWorld(bytes))?.0;
+                trc::info!("NET-NM-DECODE-WTX world: {:?}", w);
+                Ok(Self::WorldTransfer(Box::new(w)))
+            },
+            5 => {
+                let action = bincode::decode_from_slice(
+                    bytes.as_slice(),
+                    bincode::config::standard()
+                ).map_err(|_| NettingMessageKindParseError::BadUserAction(bytes))?.0;
+                trc::info!("NET-NM-DECODE-UATX action: {action:?}");
+                Ok(Self::User(action))
+            },
             6 => {
                 bytes.pop();
                 Ok(Self::NakedLogString(String::from_utf8(bytes).expect("only string passed")))
@@ -303,6 +311,7 @@ pub enum NettingMessageKindParseError {
         bytes: Vec<u8>,
     },
     BadWorld(Vec<u8>),
+    BadUserAction(Vec<u8>),
 }
 
 #[derive(Debug)]
@@ -313,6 +322,7 @@ pub enum NettingMessageParseError {
         msg: NettingMessageBytesWithOrdering
     },
     BadWorld(Vec<u8>),
+    BadUserAction(Vec<u8>),
 }
 
 #[derive(Debug)]
@@ -363,11 +373,13 @@ impl <W: bincode::Decode + bincode::Encode + Debug, A: bincode::Decode + bincode
         drop(bytes.drain(..2 * 8 + 1));
 
         if bytes.len() as u64 == expected_msg_len {
-            trc::debug!("NET-IKNOWN-PARSE parsing kind {:?}", bytes);
             let kind = match NettingMessageKind::parse(bytes) {
                 Ok(k) => k,
                 Err(NettingMessageKindParseError::BadWorld(w)) => {
                     return Err(NettingMessageParseError::BadWorld(w));
+                },
+                Err(NettingMessageKindParseError::BadUserAction(w)) => {
+                    return Err(NettingMessageParseError::BadUserAction(w));
                 },
                 Err(NettingMessageKindParseError::PartialMessage { expected_len, bytes }) => {
                     return Err(NettingMessageParseError::PartialMessage {
@@ -380,6 +392,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug, A: bincode::Decode + bincode
                     });
                 },
             };
+            trc::trace!("NET-IKNOWN-PARSE parsing kind {:?}", kind);
             Ok(NettingMessage {
                 message_id,
                 kind,
