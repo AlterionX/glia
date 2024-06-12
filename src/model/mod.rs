@@ -160,3 +160,34 @@ pub fn plane(alloc: &mut MeshAlloc, texture: Option<String>) -> TriMeshGeom {
         texture,
     )
 }
+
+/// Generates a "flat" mesh that's vertical, centered on the origin, aligned with the y/z plane.
+///
+/// Intended to be used with sprites.
+pub fn vertical_plane(alloc: &mut MeshAlloc, texture: Option<String>, uvs: [[f32; 2]; 4]) -> TriMeshGeom {
+    TriMeshGeom::new(
+        alloc,
+        geom::VMat::from_iterator(
+            4,
+            [
+                 0.5,  0.5, 0., // top right
+                -0.5,  0.5, 0., // top left
+                -0.5, -0.5, 0., // bottom left
+                 0.5, -0.5, 0., // bottom right
+            ]
+            .into_iter(),
+        ),
+        geom::FMat::from_iterator(
+            2,
+            vec![
+                0, 1, 2,
+                0, 2, 3,
+            ]
+            .into_iter(),
+        ),
+        vec![[0.0, 0.0, 0.0]; 4],
+        vec![[0.0, 0.0, 0.0]; 2],
+        uvs.to_vec(),
+        texture,
+    )
+}

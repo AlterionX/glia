@@ -211,7 +211,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug, A: bincode::Decode + bincode
                     w,
                     bincode::config::standard()
                 ).expect("no issues encoding");
-                trc::trace!("NET-NM-ENCODE-WTX bytes: {:?}", bytes);
+                trc::info!("NET-NM-ENCODE-WTX bytes: {:?}", bytes);
                 bytes.push(4); // discriminant
                 bytes
             },

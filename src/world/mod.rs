@@ -90,6 +90,7 @@ pub struct World {
 
     // Super temp thing to prove out a concept.
     pub color: [f32; 3],
+    pub text: Option<String>,
 }
 
 impl SynchronizedSimulatable<UserAction> for World {
@@ -98,6 +99,9 @@ impl SynchronizedSimulatable<UserAction> for World {
         match action.kind {
             UserActionKind::SetColor(rgb_f32) => {
                 self.color = rgb_f32;
+            },
+            UserActionKind::SetLog(ref message) => {
+                self.text = Some(message.clone());
             },
         }
     }

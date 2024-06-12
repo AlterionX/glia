@@ -1,4 +1,4 @@
-use std::{alloc::Layout, fmt::Debug, net::SocketAddr, pin::Pin, sync::{atomic::AtomicUsize, Arc}};
+use std::{alloc::Layout, fmt::Debug, mem::MaybeUninit, net::SocketAddr, pin::Pin, sync::{atomic::AtomicUsize, Arc}};
 
 use derivative::Derivative;
 
@@ -149,27 +149,34 @@ pub struct PeerConnectionData {
     pub next_transmission_number: u8,
 }
 
+type RMRecord = (chrono::DateTime<chrono::Utc>, Vec<u8>);
+type RMRecords = [RMRecord; MAX_ACTIVE_MESSAGES];
 impl Default for PeerConnectionData {
     fn default() -> Self {
         let buf = unsafe {
-            let ptr = std::alloc::alloc(Layout::new::<[(usize, [u8; MAX_UDP_DG_SIZE]); MAX_ACTIVE_MESSAGES]>());
+            let ptr = std::alloc::alloc(Layout::new::<[(usize, [u8; MAX_UDP_DG_SIZE]); MAX_ACTIVE_MESSAGES]>()) as *mut [(usize, [u8; MAX_UDP_DG_SIZE]); MAX_ACTIVE_MESSAGES];
             if ptr.is_null() {
                 panic!("oom allocating peer connection buffer");
+            }
+            for i in 0..MAX_ACTIVE_MESSAGES {
+                unsafe {
+                    // Numbers are safe to ref without init
+                    (&mut *ptr)[i].0 = 0;
+                }
             }
             Pin::new(Box::from_raw(ptr as *mut[(usize, [u8; MAX_UDP_DG_SIZE]); MAX_ACTIVE_MESSAGES]))
-        }.into();
-        let mut recent_received_messages: Pin<Box<[(chrono::DateTime<chrono::Utc>, Vec<u8>); MAX_ACTIVE_MESSAGES]>> = unsafe {
-            let ptr = std::alloc::alloc(Layout::new::<[(chrono::DateTime<chrono::Utc>, Vec<u8>); MAX_ACTIVE_MESSAGES]>());
+        };
+        let recent_received_messages: Pin<Box<RMRecords>> = unsafe {
+            let ptr: *mut (chrono::DateTime<chrono::Utc>, Vec<u8>) = std::alloc::alloc(Layout::new::<RMRecords>()) as *mut RMRecord;
             if ptr.is_null() {
                 panic!("oom allocating peer connection buffer");
             }
-            Pin::new(Box::from_raw(ptr as *mut[(chrono::DateTime<chrono::Utc>, Vec<u8>); MAX_ACTIVE_MESSAGES]))
-        }.into();
-        for (a, b) in recent_received_messages.iter_mut() {
-            // Pretend this is just prior to "debounce" period.
-            *a = Utc::now() - TimeDelta::milliseconds(300);
-            *b = vec![];
-        }
+            let reference_stamp = Utc::now() - TimeDelta::milliseconds(300);
+            for i in 0..MAX_ACTIVE_MESSAGES {
+                ptr.offset(i.try_into().unwrap()).write((reference_stamp, vec![]));
+            }
+            Box::into_pin(Box::from_raw(ptr as *mut RMRecords))
+        };
 
         Self {
             exchanged_key: None,

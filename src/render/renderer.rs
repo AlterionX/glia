@@ -596,7 +596,7 @@ impl RendererBuilder {
         Ok(buffer)
     }
 
-    fn allocate_wireframe_buffer<T: BufferContents + ?Sized>(device_memory_alloc: Arc<dyn MemoryAllocator>) -> Result<Subbuffer<T>, RendererInitializationError> {
+    fn allocate_render_settings_buffer<T: BufferContents + ?Sized>(device_memory_alloc: Arc<dyn MemoryAllocator>) -> Result<Subbuffer<T>, RendererInitializationError> {
         let results = Buffer::new_unsized(
             device_memory_alloc,
             BufferCreateInfo {
@@ -833,6 +833,7 @@ impl RendererBuilder {
         //   - configuration
         //   - wireframe rendering
         //   - camera matrix
+        //   - sprite mode UV buffer
         let vertex_buffer = Self::allocate_vertex_buffer(device_memory_alloc.clone())?;
         let face_buffer = Self::allocate_face_buffer(device_memory_alloc.clone())?;
         let uniform_counts_buffer = Self::allocate_count_buffer(device_memory_alloc.clone())?;
@@ -840,7 +841,7 @@ impl RendererBuilder {
         let uniform_light_buffer = Self::allocate_light_buffer(device_memory_alloc.clone())?;
         let uniform_material_buffer = Self::allocate_material_buffer(device_memory_alloc.clone())?;
         let staging_texture_buffer = Self::allocate_texture_staging_buffer(device_memory_alloc.clone())?;
-        let uniform_wireframe_buffer = Self::allocate_wireframe_buffer(device_memory_alloc.clone())?;
+        let uniform_render_settings_buffer = Self::allocate_render_settings_buffer(device_memory_alloc.clone())?;
         let uniform_cam_matrix_buffer = Self::allocate_cam_matrix_buffer(device_memory_alloc.clone())?;
         let configuration_buffer = Self::allocate_configuration_buffer(device_memory_alloc.clone())?;
 
@@ -863,7 +864,7 @@ impl RendererBuilder {
                 WriteDescriptorSet::buffer(1, uniform_per_mesh_buffer.clone()),
                 WriteDescriptorSet::buffer(2, uniform_light_buffer.clone()),
                 WriteDescriptorSet::buffer(3, uniform_material_buffer.clone()),
-                WriteDescriptorSet::buffer(4, uniform_wireframe_buffer.clone()),
+                WriteDescriptorSet::buffer(4, uniform_render_settings_buffer.clone()),
                 WriteDescriptorSet::buffer(5, uniform_cam_matrix_buffer.clone()),
             ],
             [],
@@ -915,7 +916,7 @@ impl RendererBuilder {
             uniform_per_mesh_buffer,
             uniform_light_buffer,
             uniform_material_buffer,
-            uniform_wireframe_buffer,
+            uniform_render_settings_buffer,
             uniform_cam_matrix_buffer,
             staging_texture_buffer,
             configuration_buffer,
@@ -962,7 +963,7 @@ pub struct Renderer {
     uniform_per_mesh_buffer: Subbuffer<[u8]>,
     uniform_light_buffer: Subbuffer<[u8]>,
     uniform_material_buffer: Subbuffer<[u8]>,
-    uniform_wireframe_buffer: Subbuffer<[u8]>,
+    uniform_render_settings_buffer: Subbuffer<[u8]>,
     uniform_cam_matrix_buffer: Subbuffer<[u8]>,
     configuration_buffer: Subbuffer<[u8]>,
     staging_texture_buffer: Subbuffer<[u8]>,
@@ -991,6 +992,17 @@ pub struct Renderer {
     pipeline_cache: Option<([u32; 3], u32, WindowId, Arc<GraphicsPipeline>)>,
 }
 
+#[derive(Debug)]
+pub enum RenderError {
+    Vulkan(Validated<VulkanError>),
+    BadSwapchain,
+}
+
+impl From<Validated<VulkanError>> for RenderError {
+    fn from(e: Validated<VulkanError>) -> Self {
+        Self::Vulkan(e)
+    }
+}
 
 impl Renderer {
     fn copy_sized_slice_to_buffer<U: ?Sized, T: Sized + Copy + std::fmt::Debug + bytemuck::Pod>(buffer: &Subbuffer<U>, to_copy: &[T]) -> Result<(), HostAccessError> {
@@ -1009,7 +1021,7 @@ impl Renderer {
         self.loaded_models.clear();
     }
 
-    pub fn render_to(&mut self, window: Arc<Window>, task: RenderTask<'_>) -> Result<(), Validated<VulkanError>> {
+    pub fn render_to(&mut self, window: Arc<Window>, task: RenderTask<'_>) -> Result<(), RenderError> {
         struct RenderTimer {
             start: Instant,
             inflight_load: Option<Instant>,
@@ -1183,7 +1195,8 @@ impl Renderer {
                     trc::trace!("RENDER-TEXTURE mesh={mesh_id} texture={file_path:?}");
                     assert!(file_path.ends_with(".png"), "only pngs are handled, and only ARGB pngs");
                     let f = std::fs::File::open(file_path).expect("provided file exists");
-                    let texture_file = img::load(std::io::BufReader::new(f), ImageFormat::Png).unwrap().into_rgba32f();
+                    let raw_texture_file = img::load(std::io::BufReader::new(f), ImageFormat::Png).unwrap();
+                    let texture_file = raw_texture_file.into_rgba32f();
                     let (texture_width, texture_height) = (texture_file.width(), texture_file.height());
                     Self::copy_sized_slice_to_buffer(&self.staging_texture_buffer.clone(), texture_file.into_raw().as_slice()).unwrap();
                     let texture_image = Image::new(
@@ -1276,14 +1289,18 @@ impl Renderer {
             Self::copy_sized_slice_to_buffer(&self.uniform_per_mesh_buffer, task.instancing_information_bytes().as_slice()).unwrap();
             Self::copy_sized_slice_to_buffer(&self.uniform_light_buffer, task.lights.to_bytes().as_slice()).unwrap();
             Self::copy_sized_slice_to_buffer(&self.uniform_counts_buffer, &[0u32, task.lights.0.len() as u32, 0u32, 0u32]).unwrap();
-            Self::copy_sized_slice_to_buffer(&self.uniform_wireframe_buffer, &[if task.draw_wireframe { 1u32 } else { 0u32 }, 0u32, 0u32, 0u32]).unwrap();
+            Self::copy_sized_slice_to_buffer(&self.uniform_render_settings_buffer, &[if task.draw_wireframe { 1u32 } else { 0u32 }, 0u32, 0u32, 0u32]).unwrap();
             Self::copy_sized_slice_to_buffer(&self.uniform_cam_matrix_buffer, task.cam.get_vp_mat().as_slice()).unwrap();
             perf.record_load_end();
         }
 
         perf.record_framebuffer_acquisition_start();
         let (active_framebuffer, afidx, framebuffer_future) = {
-            let (mut preferred, mut suboptimal, mut acquire_next_image) = swapchain::acquire_next_image(Arc::clone(&window_swapchain.swapchain), None).unwrap();
+            let Ok((mut preferred, mut suboptimal, mut acquire_next_image)) = swapchain::acquire_next_image(Arc::clone(&window_swapchain.swapchain), None) else {
+                // If this fails, we need to regenerate the swapchain. Blow it up and try again.
+                self.windowed_swapchain.remove(&window.id());
+                return Err(RenderError::BadSwapchain);
+            };
             const MAX_RECREATION_OCCURRENCES: usize = 3;
             let mut times_recreated = 0;
             while suboptimal && times_recreated < MAX_RECREATION_OCCURRENCES {

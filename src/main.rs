@@ -1,3 +1,5 @@
+#![feature(maybe_uninit_uninit_array, maybe_uninit_array_assume_init)]
+
 // Ops
 mod cfg;
 mod log;
@@ -31,20 +33,22 @@ use crate::{bus::Bus, netting::{Netting, NettingApi, NettingMessageKind}, simula
 
 const TARGET_FPS: u16 = 120;
 
-#[derive(Debug, Copy, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub enum UserActionKind {
     SetColor([f32; 3]),
+    SetLog(String),
 }
 
 impl UserActionKind {
     pub fn should_broadcast(&self) -> bool {
         match self {
             Self::SetColor(_) => true,
+            Self::SetLog(_) => true,
         }
     }
 }
 
-#[derive(Debug, Copy, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
 pub struct UserAction {
     pub sim_time: u64,
     pub sender: ClientId,
@@ -359,7 +363,11 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
                     user_action_tx.send(ActionIntake::Local(UserActionKind::SetColor([0., 0., 1.]))).await.ok()
                 },
                 msg => {
-                    net_api.broadcast(NettingMessageKind::NakedLogString(msg.to_owned()).into_msg()).await.ok()
+                    if net_api.broadcast(NettingMessageKind::NakedLogString(format!("Received {msg:?}")).into_msg()).await.ok().is_none() {
+                        None
+                    } else {
+                        user_action_tx.send(ActionIntake::Local(UserActionKind::SetLog(msg.to_owned()))).await.ok()
+                    }
                 },
             }).is_none() {
                 break;

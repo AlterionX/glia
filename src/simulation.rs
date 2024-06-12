@@ -13,7 +13,7 @@ pub enum ActionIntake<LA, GA> {
 
 pub trait GlobalizableAction {
     type Output;
-    fn globalize(self, timeframe: u64, sender: ClientId) -> Self::Output;
+    fn globalize(self, sim_generation: u64, sender: ClientId) -> Self::Output;
 }
 
 impl GlobalizableAction for UserActionKind {
@@ -27,16 +27,16 @@ impl GlobalizableAction for UserActionKind {
     }
 }
 
-pub trait SimulationTimeframeAttached {
+pub trait SimulationGenerationAttached {
     fn rank_key(&self) -> (u64, ClientId);
-    fn timeframe(&self) -> u64;
+    fn sim_generation(&self) -> u64;
 }
 
-impl SimulationTimeframeAttached for UserAction {
+impl SimulationGenerationAttached for UserAction {
     fn rank_key(&self) -> (u64, ClientId) {
         (self.sim_time, self.sender)
     }
-    fn timeframe(&self) -> u64 {
+    fn sim_generation(&self) -> u64 {
         self.sim_time
     }
 }
@@ -49,7 +49,7 @@ pub struct WorldStash<W, A> {
     max_generation: u64,
 }
 
-impl <W: Clone + SynchronizedSimulatable<A>, A: SimulationTimeframeAttached> WorldStash<W, A> {
+impl <W: Clone + SynchronizedSimulatable<A>, A: SimulationGenerationAttached> WorldStash<W, A> {
     // Keep 3 seconds of world data.
     const MAX_HISTORY: usize = 300;
 
@@ -65,7 +65,7 @@ impl <W: Clone + SynchronizedSimulatable<A>, A: SimulationTimeframeAttached> Wor
         }
         let earliest_gen = self.historical_worlds.front().unwrap().generation();
         while let Some(a) = self.historical_actions.front() {
-            if a.timeframe() >= earliest_gen {
+            if a.sim_generation() >= earliest_gen {
                 break;
             }
             self.historical_actions.pop_front();
@@ -97,22 +97,27 @@ impl <W: Clone + SynchronizedSimulatable<A>, A: SimulationTimeframeAttached> Wor
             // If the action is past the earliest generation, ignore it. We keep a large enough
             // buffer that it should be enough (O(seconds)) so anything before that is probably
             // a bad packet. If it still desyncs, move on.
-            if w.generation() > action.timeframe() {
+            if w.generation() > action.sim_generation() {
                 return;
             }
         }
 
-        let recalculation_start = action.timeframe();
+        let recalculation_start = action.sim_generation();
         self.historical_actions.push_back(action);
         self.historical_actions.make_contiguous().sort_by_key(|a| a.rank_key());
 
         // We will need to recalculate all the worlds prior to this point so, time to drop worlds
         // until we're good.
+        let mut num_dropped_worlds = 0;
         while let Some(w) = self.peek_most_recent_not_last() {
             if w.generation() <= recalculation_start {
                 break;
             }
+            num_dropped_worlds += 1;
             self.historical_worlds.pop_back();
+        }
+        if num_dropped_worlds > 5 {
+            trc::info!("HIGH-DROP num_worlds_dropped={num_dropped_worlds:?}");
         }
     }
 
@@ -150,7 +155,7 @@ impl <W: Clone + SynchronizedSimulatable<A>, A: SimulationTimeframeAttached> Wor
     }
 
     fn actions_for_generation(&self, gen: u64) -> impl Iterator<Item=&A> {
-        self.historical_actions.iter().filter(move |a| a.timeframe() == gen)
+        self.historical_actions.iter().filter(move |a| a.sim_generation() == gen)
     }
 }
 
@@ -210,7 +215,7 @@ pub struct Simulation<W, LA, GA> {
     net_api: NettingApi<W, GA>,
 }
 
-impl <W: Default + Clone + SynchronizedSimulatable<GA>, LA, GA: SimulationTimeframeAttached> Simulation<W, LA, GA> {
+impl <W: Default + Clone + SynchronizedSimulatable<GA>, LA, GA: SimulationGenerationAttached> Simulation<W, LA, GA> {
     pub fn init(inputs: Inputs<W, LA, GA>, outputs: Outputs) -> Simulation<W, LA, GA> {
         Simulation {
             own_client_id: inputs.own_client_id,
@@ -244,7 +249,7 @@ pub struct SimulationHandle {
 impl<
     W: SynchronizedSimulatable<GA> + Clone + Send + Default + Sync + 'static + Debug + bincode::Encode + bincode::Decode,
     LA: Debug + GlobalizableAction<Output=GA> + Send + 'static,
-    GA: Debug + Send + Clone + bincode::Encode + bincode::Decode + SimulationTimeframeAttached + 'static,
+    GA: Debug + Send + Clone + bincode::Encode + bincode::Decode + SimulationGenerationAttached + 'static,
 > Simulation<W, LA, GA> {
     pub fn start(mut self) -> SimulationHandle {
         let sim_handle = ThreadDeathReporter::new(&self.death_tally, "sim").spawn(async move {
@@ -261,6 +266,7 @@ impl<
 
                 // The world loops repeatedly.
                 let mut target_sim_time = Utc::now();
+                let mut last_framesync_time = Utc::now();
                 loop {
                     let now = Utc::now();
                     if now < target_sim_time {
@@ -323,9 +329,13 @@ impl<
                     // TODO force fixed wake up
                     self.world_stash.push_world(working_world);
 
-                    let Ok(()) = self.net_api.broadcast(NettingMessageKind::FrameSync(working_world_generation).into_msg()).await else {
-                        break;
-                    };
+                    // Only send a framesync every 2 seconds
+                    if now - last_framesync_time > chrono::TimeDelta::seconds(2) {
+                        let Ok(()) = self.net_api.broadcast(NettingMessageKind::FrameSync(working_world_generation).into_msg()).await else {
+                            break;
+                        };
+                        last_framesync_time = now;
+                    }
                     if let Some(extra_required_delay) = self.framesync.calculate_delay(working_world_generation).await {
                         target_sim_time -= extra_required_delay;
                     }
