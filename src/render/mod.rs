@@ -8,7 +8,7 @@ use tokio::{sync::{mpsc::{Sender, Receiver, error::TryRecvError}, oneshot}, task
 use vulkano::format::ClearColorValue;
 use winit::window::Window;
 
-use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter}, model::{camera::{Camera, OrthoCamera}, geom::MeshAlloc, AffineTransform}, simulation::SnapshotWorldState, world::World};
+use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter}, model::{camera::{Camera, OrthoCamera}, geom::MeshAlloc, AffineTransform}, simulation::{SnapshotWorldState, SynchronizedSimulatable}, world::World};
 
 // use self::renderer::{Renderer, RendererPreferences};
 
@@ -63,11 +63,35 @@ impl Renderable for World {
 
     fn into_render_task_with_cache(self, (font_atlas, mesh_alloc): Self::Cache<'_>) -> RenderTask<'_> {
         let mut draws = vec![];
-        if let Some(t) = self.text {
+        { // Generation print
+            let gen = self.generation();
+            let gen_num_chars = {
+                let mut g = gen;
+                let mut n = 1;
+                while { n += 1; g != 0 } { g /= 10; }
+                n
+            };
             let mut base = AffineTransform::identity();
-            base.scaling[0] = 0.25;
+            base.scaling[0] = 0.1;
             base.scaling[1] = 0.25;
             base.scaling[2] = 0.25;
+            base.pos[0] = 0.5 + 0.025 - 0.05 * (gen_num_chars + 4) as f32;
+            base.pos[1] = 0.5 - 0.0625;
+
+            let tasks = DrawTask::texts_as_draw_tasks(
+                font_atlas,
+                vec![(base, format!("Gen {:?}", self.generation()))],
+                mesh_alloc,
+            );
+            draws.extend(tasks);
+        };
+        if let Some(t) = self.text {
+            let mut base = AffineTransform::identity();
+            base.scaling[0] = 0.1;
+            base.scaling[1] = 0.25;
+            base.scaling[2] = 0.25;
+            base.pos[0] = -0.5 + 0.025;
+            base.pos[1] = 0.5 - 0.0625;
 
             let tasks = DrawTask::texts_as_draw_tasks(
                 font_atlas,
@@ -140,29 +164,6 @@ impl <W: Sync + Send + for <'a> Renderable<Cache<'a>=(&'a FontAtlas, &'a mut Mes
 
                     continue;
                 };
-
-                {
-                    let mut base = AffineTransform::identity();
-                    base.scaling[0] = 0.1;
-                    base.scaling[1] = 0.25;
-                    base.scaling[2] = 0.25;
-                    base.pos[0] = -0.5 + 0.05;
-                    base.pos[1] = 0.5 - 0.125;
-
-                    let something = &mut OsRng.gen_range(0..99);
-                    let draws = DrawTask::texts_as_draw_tasks(
-                        &font_atlas,
-                        vec![(base, format!("hello there {:?}", something))],
-                        &mut mesh_alloc,
-                    );
-                    renderer.render_to(window.clone(), RenderTask {
-                        draw_wireframe: false,
-                        clear_color: ClearColorValue::Float([1., 0., 0., 1.]),
-                        draws,
-                        lights: LightCollection(vec![]),
-                        cam: Camera::Orthographic(OrthoCamera::default()),
-                    });
-                }
 
                 // Skip over non-recent render requests to get the most recent.
                 let Some(mut initial) = self.inputs.trigger_render_rx.recv_for_ms(100).await.value() else {
