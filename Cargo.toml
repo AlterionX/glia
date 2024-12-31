@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies.derivative]
 version = "2"
 [dependencies.thiserror]
-version = "1"
+version = "2"
 
 [dependencies.serde]
 version = "1"
@@ -33,7 +33,8 @@ version = "2.0.0-rc.3"
 version = "2"
 
 [dependencies.mio]
-version = "0"
+version = "1"
+features = ["os-poll", "net"]
 [dependencies.tokio]
 version = "1"
 features = ["full"]

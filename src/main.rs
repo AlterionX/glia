@@ -171,7 +171,7 @@ fn main() {
             todo!("handle error report -- {err:?}");
         },
     }});
-    // TODO determine why this is necessary.
+    // TODO determine why this is necessary, window hangs otherwise
     rt.shutdown_timeout(TimeDelta::milliseconds(10).to_std().unwrap());
 }
 
@@ -257,6 +257,13 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
         net_api: net_api.clone(),
         own_client_id: net.own_client_id(),
         death_tally: Arc::clone(&death_tally),
+        // Bootstrap IP display, we'll pretend it's global
+        initial_world: {
+            let mut w = World::default();
+            let socket_address = net.own_socket_address();
+            w.text = Some(format!("Your Address: {:?}", socket_address));
+            w
+        },
     }, simulation::Outputs {
         running: Arc::clone(&sim_running),
         draw_call_tx,
@@ -278,7 +285,7 @@ async fn main_with_error_handler() -> Result<(), ReportableError> {
             ("net-collater", net_collater_kill_tx),
             ("net-connman", net_connman_kill_tx),
             ("net-parceler", net_parceler_kill_tx),
-            ("renderer", renderer_kill_tx),
+            ("render", renderer_kill_tx),
             ("sim", sim_kill_tx),
             ("bus", bus_kill_tx),
             ("sys", sys_kill_tx),

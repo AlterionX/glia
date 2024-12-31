@@ -142,6 +142,10 @@ impl <W, A> Netting<W, A> {
     pub fn own_client_id(&self) -> ClientId {
         self.connman.own_client_id()
     }
+
+    pub fn own_socket_address(&self) -> SocketAddr {
+        self.connman.own_socket_address()
+    }
 }
 
 #[derive(Clone)]

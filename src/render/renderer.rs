@@ -11,7 +11,7 @@ use vulkano::{
     }, command_buffer::{
         allocator::{
             CommandBufferAllocator, StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo
-        }, ClearAttachment, ClearRect, CommandBufferBeginInfo, CommandBufferLevel, CommandBufferUsage, CopyBufferToImageInfo, RecordingCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo
+        }, AutoCommandBufferBuilder, ClearAttachment, ClearRect, CommandBufferBeginInfo, CommandBufferLevel, CommandBufferUsage, CopyBufferToImageInfo, RecordingCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo
     }, descriptor_set::{
         allocator::{
             DescriptorSetAllocator, StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo
@@ -58,12 +58,7 @@ use vulkano::{
         }, layout::{
             PipelineLayoutCreateFlags,
             PipelineLayoutCreateInfo,
-        },
-        Pipeline,
-        GraphicsPipeline,
-        PipelineBindPoint,
-        PipelineLayout,
-        PipelineShaderStageCreateInfo,
+        }, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo
     }, render_pass::{
         Framebuffer, RenderPass, Subpass
     }, shader::{
@@ -1224,22 +1219,17 @@ impl Renderer {
                     ).unwrap();
 
                     // TODO Batch these somehow.
-                    let mut image_copy_builder = RecordingCommandBuffer::new(
+                    let mut image_copy_builder = AutoCommandBufferBuilder::primary(
                         Arc::clone(&self.command_buffer_alloc),
                         self.selected_device_queue.queue_family_index(),
-                        CommandBufferLevel::Primary,
-                        CommandBufferBeginInfo {
-                            usage: CommandBufferUsage::OneTimeSubmit,
-                            inheritance_info: None,
-                            ..Default::default()
-                        },
+                        CommandBufferUsage::OneTimeSubmit,
                     ).unwrap();
                     image_copy_builder
                         .copy_buffer_to_image(CopyBufferToImageInfo {
                             ..CopyBufferToImageInfo::buffer_image(self.staging_texture_buffer.clone(), Arc::clone(&texture_image))
                         })
                         .unwrap();
-                    let image_copy_buffer = image_copy_builder.end().unwrap();
+                    let image_copy_buffer = image_copy_builder.build().unwrap();
                     vulkano::sync::now(Arc::clone(&self.device))
                         .then_execute(Arc::clone(&self.selected_device_queue), image_copy_buffer)
                         .unwrap()
@@ -1446,15 +1436,10 @@ impl Renderer {
         perf.record_command_record_start();
 
         let base_queue = &self.selected_device_queue;
-        let mut builder = RecordingCommandBuffer::new(
+        let mut builder = AutoCommandBufferBuilder::primary(
             Arc::clone(&self.command_buffer_alloc),
             self.selected_device_queue.queue_family_index(),
-            CommandBufferLevel::Primary,
-            CommandBufferBeginInfo {
-                usage: CommandBufferUsage::OneTimeSubmit,
-                inheritance_info: None,
-                ..Default::default()
-            }
+            CommandBufferUsage::OneTimeSubmit,
         )
             .tap_err(|e| trc::error!("TOTALITY-RENDERER-RENDER-TO-FAILED source=clear_pipeline error=command_buffer_alloc {e}"))?;
         builder
@@ -1545,7 +1530,7 @@ impl Renderer {
         builder
             .end_render_pass(SubpassEndInfo { ..Default::default() })
             .unwrap();
-        let clear_buffer = builder.end().unwrap();
+        let clear_buffer = builder.build().unwrap();
 
         perf.record_command_record_end();
 

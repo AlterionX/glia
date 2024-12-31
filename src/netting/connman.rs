@@ -1,4 +1,4 @@
-use std::{alloc::Layout, fmt::Debug, mem::MaybeUninit, net::SocketAddr, pin::Pin, sync::{atomic::AtomicUsize, Arc}};
+use std::{alloc::Layout, fmt::Debug, net::SocketAddr, pin::Pin, sync::{atomic::AtomicUsize, Arc}};
 
 use derivative::Derivative;
 
@@ -322,7 +322,7 @@ pub struct PeerConnectionMessageIter<'a> {
     secondary_idx: usize,
 }
 
-impl <'a> PeerConnectionMessageIter<'a> {
+impl PeerConnectionMessageIter<'_> {
     fn next(&mut self) -> Option<(
         SocketAddr,
         &'_ mut (usize, [u8; MAX_UDP_DG_SIZE]),
@@ -438,6 +438,7 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static, A: bincode:
             let mut readable = false;
             // TODO Convert to array?
             let mut connections = PeerConnectionLedger::default();
+
 
             // TODO Make this await a bit more.
             loop {
@@ -797,6 +798,10 @@ impl <W: bincode::Decode + bincode::Encode + Debug + Send + 'static, A: bincode:
 impl <W, A> ConnectionManager<W, A> {
     pub fn own_client_id(&self) -> ClientId {
         self.outputs.own_cid
+    }
+
+    pub fn own_socket_address(&self) -> SocketAddr {
+        self.outputs.own_addr
     }
 }
 

@@ -1,7 +1,7 @@
-use std::sync::{atomic::{AtomicBool, AtomicUsize}, Arc};
+use std::sync::{atomic::AtomicUsize, Arc};
 
-use tokio::{sync::{mpsc::Sender, oneshot}, task::JoinHandle};
-use winit::{application::ApplicationHandler, error::EventLoopError, event::{KeyEvent, WindowEvent}, event_loop::EventLoop, keyboard::{KeyCode, PhysicalKey}, window::Window};
+use tokio::sync::{mpsc::Sender, oneshot};
+use winit::{application::ApplicationHandler, error::EventLoopError, event::WindowEvent, event_loop::EventLoop, keyboard::{KeyCode, PhysicalKey}, window::Window};
 
 use crate::exec;
 
@@ -19,9 +19,6 @@ pub struct SystemBus {
     eloop: EventLoop<()>,
     inputs: Inputs,
     outputs: Outputs,
-}
-
-pub struct SystemBusHandle {
 }
 
 pub struct WindowingManager {
@@ -45,7 +42,7 @@ impl ApplicationHandler for WindowingManager {
         });
     }
 
-    fn window_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, window_id: winit::window::WindowId, event: winit::event::WindowEvent) {
+    fn window_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, _window_id: winit::window::WindowId, event: winit::event::WindowEvent) {
         if exec::kill_requested(&mut self.kill_rx) {
             trc::info!("SYS -- Close requested");
             self.should_exit = true;
@@ -146,7 +143,7 @@ impl ApplicationHandler for WindowingManager {
                 PhysicalKey::Unidentified(_) => {},
             },
             _ => {
-                trc::trace!("Unknown even {event:?}");
+                trc::trace!("Unknown event {event:?}");
             },
         }
     }
@@ -155,9 +152,10 @@ impl ApplicationHandler for WindowingManager {
         if self.should_exit {
             trc::info!("KILL sys");
             for (target, kill_tx) in self.kill_txs.drain(..) {
-                trc::info!("KILL-TX {:?}", target);
+                trc::info!("KILL-TX {}", target);
                 kill_tx.send(()).ok();
             }
+            trc::info!("EVENT LOOP EXIT");
             event_loop.exit();
         }
     }
@@ -204,7 +202,7 @@ impl SystemBus {
         }
 
         let tokio_metrics = tokio::runtime::Handle::current().metrics();
-        if tokio_metrics.active_tasks_count() != 0 {
+        if tokio_metrics.num_alive_tasks() != 0 {
             let handle = tokio::spawn(async move {
                 for (i, task) in tokio::runtime::Handle::current().dump().await.tasks().iter().enumerate() {
                     trc::info!("GLIA (only one task expected) tokio dump {}", i);
@@ -214,9 +212,9 @@ impl SystemBus {
             while !handle.is_finished() {}
         }
         trc::info!(
-            "GLIA terminated, shutting down tokio --- remaining tasks: {:?} --- remaining injected tasks: {:?} ---- blocking threads: {:?} ---- idle threads: {:?}",
-            tokio_metrics.active_tasks_count(),
-            tokio_metrics.injection_queue_depth(),
+            "GLIA terminated, shutting down tokio --- remaining tasks: {:?} --- remaining injected tasks: {:?} ---- blocking threads: {:?} (current thread) ---- idle threads: {:?}",
+            tokio_metrics.num_alive_tasks(),
+            tokio_metrics.global_queue_depth(),
             tokio_metrics.num_blocking_threads(),
             tokio_metrics.num_idle_blocking_threads(),
         );

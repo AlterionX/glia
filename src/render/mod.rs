@@ -1,7 +1,6 @@
 use std::sync::{atomic::AtomicUsize, Arc};
 
 use chrono::TimeDelta;
-use rand::{rngs::OsRng, Rng};
 use renderer::{RenderError, RendererBuilder, RendererPreferences};
 use task::{DrawTask, FontAtlas, LightCollection, RenderTask};
 use tokio::{sync::{mpsc::{Sender, Receiver, error::TryRecvError}, oneshot}, task::JoinHandle};
@@ -16,6 +15,7 @@ pub mod task;
 mod renderer;
 mod shaders;
 
+#[derive(Debug)]
 pub enum RenderScene {
     Sim,
     Menu,
@@ -92,10 +92,49 @@ impl Renderable for World {
             base.scaling[2] = 0.25;
             base.pos[0] = -0.5 + 0.025;
             base.pos[1] = 0.5 - 0.0625;
+            // shift lower on the screen to avoid overlap with generation
+            base.pos[1] -= 0.13;
+
+            // TODO better scaling
+            // TODO proper text wrapping based on window size, text size, etc
+            let mut line_length = 20;
+            let mut adjusted_scaling = 1f32;
+            // Arbitarily chosen point to start scaling down.
+            // TODO use character count instead of this
+            if t.len() > 40 {
+                adjusted_scaling = 0.25;
+                line_length = 40;
+                base.scaling[0] *= adjusted_scaling;
+                base.scaling[1] *= adjusted_scaling;
+                base.scaling[2] *= adjusted_scaling;
+                // shift a bit to the left for decreased width.
+                base.pos[0] -= 0.0125;
+            }
+            let text_chunks = { 
+                let mut cc = t.chars().peekable();
+                let mut chunk_slices = vec![];
+                while cc.peek().is_some() {
+                    let mut buffer = String::new();
+                    for _i in 0..line_length {
+                        if let Some(c) = cc.next() {
+                            buffer.push(c);
+                        }
+                    }
+                    if !buffer.is_empty() {
+                        chunk_slices.push(buffer);
+                    }
+                }
+                chunk_slices
+            };
 
             let tasks = DrawTask::texts_as_draw_tasks(
                 font_atlas,
-                vec![(base, t)],
+                text_chunks.into_iter().enumerate().map(|(i, c)| {
+                    let mut base_line = base.clone();
+                    base_line.pos[1] -= 0.13 * (i as f32) * adjusted_scaling;
+
+                    (base_line, c)
+                }).collect(),
                 mesh_alloc,
             );
             draws.extend(tasks);
@@ -210,7 +249,7 @@ impl <W: Sync + Send + for <'a> Renderable<Cache<'a>=(&'a FontAtlas, &'a mut Mes
                     },
                 };
 
-                match renderer.render_to(window.clone(), render_task) {
+                match renderer.render_to(window.clone(), dbg!(render_task)) {
                     Ok(()) => {},
                     Err(RenderError::BadSwapchain) => {
                         // We'll just ignore this, we can do it later.

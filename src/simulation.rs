@@ -1,9 +1,9 @@
 use std::{collections::{HashMap, VecDeque}, fmt::Debug, sync::{atomic::{AtomicBool, AtomicUsize}, Arc}};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use tokio::{sync::{mpsc::{Receiver, Sender, error::TryRecvError}, oneshot, RwLock}, task::JoinHandle};
 
-use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter, TimeoutOutcome}, netting::{ClientId, NettingApi, NettingMessage, NettingMessageKind}, render::RenderScene, UserAction, UserActionKind};
+use crate::{exec::{self, ReceiverTimeoutExt, ThreadDeathReporter, TimeoutOutcome}, netting::{ClientId, NettingApi, NettingMessageKind}, render::RenderScene, UserAction, UserActionKind};
 
 // TODO Fundamentally refactor action flow so that this isn't necessary.
 pub enum ActionIntake<LA, GA> {
@@ -188,6 +188,7 @@ pub struct Inputs<W, LA, GA> {
     pub user_action_rx: Receiver<ActionIntake<LA, GA>>,
     pub death_tally: Arc<AtomicUsize>,
     pub own_client_id: ClientId,
+    pub initial_world: W,
 }
 
 #[derive(Clone)]
@@ -215,14 +216,14 @@ pub struct Simulation<W, LA, GA> {
     net_api: NettingApi<W, GA>,
 }
 
-impl <W: Default + Clone + SynchronizedSimulatable<GA>, LA, GA: SimulationGenerationAttached> Simulation<W, LA, GA> {
+impl <W: Clone + SynchronizedSimulatable<GA>, LA, GA: SimulationGenerationAttached> Simulation<W, LA, GA> {
     pub fn init(inputs: Inputs<W, LA, GA>, outputs: Outputs) -> Simulation<W, LA, GA> {
         Simulation {
             own_client_id: inputs.own_client_id,
             kill_rx: inputs.kill_rx,
             user_action_rx: inputs.user_action_rx,
             running: Arc::clone(&outputs.running),
-            world_stash: WorldStash::new(W::default()),
+            world_stash: WorldStash::new(inputs.initial_world),
             run_state_rx: inputs.run_state_rx,
             force_jump_rx: inputs.force_jump_rx,
             force_world_reset_rx: inputs.force_world_reset_rx,
@@ -257,11 +258,32 @@ impl<
                 if exec::kill_requested(&mut self.kill_rx) { return; }
 
                 self.running.store(false, std::sync::atomic::Ordering::Relaxed);
-                while let Some(run_state) = self.run_state_rx.recv().await {
-                    if run_state {
-                        break;
+
+                while match self.run_state_rx.try_recv() {
+                    Ok(run_state) => !run_state,
+                    Err(TryRecvError::Empty) => true,
+                    Err(TryRecvError::Disconnected) => {
+                        trc::error!("RUN-STATE-INTAKE-DISCONNECT");
+                        continue 'main_loop;
                     }
+                } {
+
+                    // We need to force rendering since initial state isn't necessarily empty.
+                    if let Ok(snapshot_request) = self.request_snapshot_rx.try_recv() {
+                        let snap = self.world_stash.snapshot();
+                        // We're kinda fine with this since if the other side closed, it's fine.
+                        snapshot_request.send(snap).ok();
+                    }
+                    let temp_channel = self.draw_call_tx.clone();
+                    tokio::spawn(async move {
+                        // TODO Change this to actual scene render
+                        temp_channel.send(RenderScene::Sim).await.ok();
+                    });
+
+                    // Wait a non-zero amount of time that feels like no time.
+                    tokio::time::sleep(TimeDelta::milliseconds(20).to_std().unwrap()).await;
                 }
+
                 self.running.store(true, std::sync::atomic::Ordering::Relaxed);
 
                 // The world loops repeatedly.
