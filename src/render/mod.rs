@@ -249,7 +249,7 @@ impl <W: Sync + Send + for <'a> Renderable<Cache<'a>=(&'a FontAtlas, &'a mut Mes
                     },
                 };
 
-                match renderer.render_to(window.clone(), dbg!(render_task)) {
+                match renderer.render_to(window.clone(), render_task) {
                     Ok(()) => {},
                     Err(RenderError::BadSwapchain) => {
                         // We'll just ignore this, we can do it later.
